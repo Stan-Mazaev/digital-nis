@@ -1,0 +1,116 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Узел: server mode (:8080)",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/nis-node",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "-config",
+        "configs/node-smolensk.yaml"
+      ],
+      "env": {
+        "APP_ENV": "development"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Узел: demo mode (offline)",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/nis-node",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "-config",
+        "configs/node-smolensk.yaml",
+        "-demo"
+      ],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Оракул Росреестра (:8081)",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/oracle-rosreestr",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "-config",
+        "configs/oracle-mock.yaml"
+      ],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Оракул Росреестра (reject all)",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/oracle-rosreestr",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "-config",
+        "configs/oracle-mock.yaml",
+        "-reject"
+      ],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Аудитор: full-audit",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/auditor-cli",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "-db",
+        "data/nis-state",
+        "-cmd",
+        "full-audit"
+      ],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Бенчмарк: последовательный",
+      "type": "go",
+      "request": "launch",
+      "mode": "test",
+      "program": "${workspaceFolder}/benchmark",
+      "args": [
+        "-bench=BenchmarkFullCycle",
+        "-benchtime=100x",
+        "-run=^$",
+        "-v"
+      ],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Бенчмарк: параллельный",
+      "type": "go",
+      "request": "launch",
+      "mode": "test",
+      "program": "${workspaceFolder}/benchmark",
+      "args": [
+        "-bench=BenchmarkParallelFullCycle",
+        "-benchtime=100x",
+        "-run=^$",
+        "-v"
+      ],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Тесты: все пакеты",
+      "type": "go",
+      "request": "launch",
+      "mode": "test",
+      "program": "${workspaceFolder}",
+      "args": [
+        "-test.v"
+      ],
+      "console": "integratedTerminal"
+    }
+  ]
+}

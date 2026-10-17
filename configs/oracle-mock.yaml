@@ -1,0 +1,25 @@
+# Конфигурация сервиса-эмулятора оракула Росреестра.
+
+listen_addr: ":8081"
+
+# Приватный ключ оракула зафиксирован.
+private_key_hex: ""
+
+generate_if_missing: false
+
+log_requests: true
+
+# mTLS-транспорт (защищённое соединение).
+#
+# Отличия от обычного HTTPS: сервер тоже проверяет клиента —
+# у узла должен быть client.crt, подписанный тем же CA.
+#
+# enabled: false → HTTP, сервер не проверяет клиента (быстрый прототип).
+# enabled: true  → HTTPS с RequireAndVerifyClientCert.
+tls:
+  enabled: true
+  cert_dir: "./certs"
+  ca_cert_path: "./certs/ca.crt"
+  server_cert_path: "./certs/server.crt"
+  server_key_path: "./certs/server.key"
+  generate_if_missing: true

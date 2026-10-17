@@ -1,0 +1,9 @@
+{
+  "recommendations": [
+    "golang.go",
+    "redhat.vscode-yaml",
+    "editorconfig.editorconfig",
+    "streetsidesoftware.code-spell-checker",
+    "streetsidesoftware.code-spell-checker-russian"
+  ]
+}

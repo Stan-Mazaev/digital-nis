@@ -1,0 +1,119 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build: all",
+      "type": "shell",
+      "command": "go",
+      "args": [
+        "build",
+        "-o", "${workspaceFolder}/bin/nis-node.exe", "./cmd/nis-node"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "build: oracle",
+      "type": "shell",
+      "command": "go",
+      "args": [
+        "build",
+        "-o", "${workspaceFolder}/bin/oracle-rosreestr.exe",
+        "./cmd/oracle-rosreestr"
+      ],
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "build: auditor",
+      "type": "shell",
+      "command": "go",
+      "args": [
+        "build",
+        "-o", "${workspaceFolder}/bin/auditor-cli.exe",
+        "./cmd/auditor-cli"
+      ],
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "test: all",
+      "type": "shell",
+      "command": "go",
+      "args": ["test", "./..."],
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "test: crypto",
+      "type": "shell",
+      "command": "go",
+      "args": ["test", "./internal/crypto/...", "-v"],
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "test: engine",
+      "type": "shell",
+      "command": "go",
+      "args": ["test", "./internal/engine/...", "-v"],
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "bench: sequential",
+      "type": "shell",
+      "command": "go",
+      "args": [
+        "test", "./benchmark",
+        "-bench=BenchmarkFullCycle",
+        "-benchtime=500x",
+        "-run=^$",
+        "-v"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "bench: parallel",
+      "type": "shell",
+      "command": "go",
+      "args": [
+        "test", "./benchmark",
+        "-bench=BenchmarkParallelFullCycle",
+        "-benchtime=200x",
+        "-run=^$",
+        "-v"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "audit: full",
+      "type": "shell",
+      "command": "${workspaceFolder}/bin/auditor-cli.exe",
+      "args": [
+        "-db", "${workspaceFolder}/data/nis-state",
+        "-cmd", "full-audit"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "clean",
+      "type": "shell",
+      "command": "Remove-Item",
+      "args": [
+        "-Recurse", "-Force",
+        "${workspaceFolder}/bin",
+        "${workspaceFolder}/data"
+      ],
+      "options": {
+        "shell": {
+          "executable": "powershell.exe",
+          "args": ["-Command"]
+        }
+      },
+      "problemMatcher": []
+    }
+  ]
+}

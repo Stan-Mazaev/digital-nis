@@ -1,0 +1,30 @@
+node_id: nis-node-01
+
+db_path: ./data/nis-state
+
+api_addr: ":8080"
+
+# URL сервиса-оракула. https:// при включённом mTLS.
+oracle_url: https://localhost:8081
+
+# mTLS для соединения с оракулом.
+# enabled: true → используем client.crt / client.key из ./certs/.
+oracle_tls:
+  enabled: true
+  ca_cert_path: "./certs/ca.crt"
+  client_cert_path: "./certs/client.crt"
+  client_key_path: "./certs/client.key"
+
+demo_mode: true
+
+keys:
+  issuer_private_hex: ""
+  issuer_public_hex: ""
+  oracle_private_hex: "0c6d1195fe69a87f56c04bb2e44c132d9074443f6394eba798d3b47982b6afe7"
+  oracle_public_hex: "f21ad23426bda5c5724f7146a08654775cd15d11c0cb0c4ea5ee486b2153852b1918aacd22415a85181e4f1d6a74675ce4d359eab04b918cfbf0671a25a4c43e"
+
+  # Секретный ключ HMAC для формирования обезличенного идентификатора
+  # военнослужащего (32+ байта в hex). Пусто в demo → сгенерируется.
+  military_hash_key_hex: ""
+
+  generate_if_missing: true

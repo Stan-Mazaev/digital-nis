@@ -1,0 +1,6077 @@
+﻿// ============================================
+// FILE: bench_test.go
+// ============================================
+// РџР°РєРµС‚ benchmark СЃРѕРґРµСЂР¶РёС‚ СЃС‚СЂРµСЃСЃ-С‚РµСЃС‚С‹ В«Р¦РёС„СЂРѕРІРѕР№ РќРРЎВ» РґР»СЏ
+// С„РѕСЂРјРёСЂРѕРІР°РЅРёСЏ РєРѕР»РёС‡РµСЃС‚РІРµРЅРЅС‹С… РїРѕРєР°Р·Р°С‚РµР»РµР№ РІ СЃС‚Р°С‚СЊСЏС… Р’РђРљ.
+//
+// Р’РђР–РќРћ: Р±РµРЅС‡РјР°СЂРє РёСЃРїРѕР»СЊР·СѓРµС‚ РїРѕСЃР»РµРґРѕРІР°С‚РµР»СЊРЅС‹Р№ Рё РїР°СЂР°Р»Р»РµР»СЊРЅС‹Р№
+// СЂРµР¶РёРјС‹. РџР°СЂР°Р»Р»РµР»СЊРЅС‹Р№ СЂРµР¶РёРј РѕРіСЂР°РЅРёС‡РµРЅ РјСЊСЋС‚РµРєСЃРѕРј РІРЅСѓС‚СЂРё
+// crypto.GOSTProvider вЂ” bi-zone РЅРµР±РµР·РѕРїР°СЃРµРЅ РїСЂРё РїР°СЂР°Р»Р»РµР»СЊРЅС‹С…
+// РїРѕРґРїРёСЃСЏС… РЅР° РѕРґРЅРѕР№ Curve (РїР°РЅРёРєР° math/big: underflow).
+// РџРѕСЌС‚РѕРјСѓ РїР°СЂР°Р»Р»РµР»СЊРЅС‹Рµ РІРѕСЂРєРµСЂС‹ РїРѕРєР°Р·С‹РІР°СЋС‚ РІС‹РёРіСЂС‹С€ РЅР° I/O Рё
+// Badger, РЅРѕ РЅРµ РЅР° Р­Р¦Рџ.
+package benchmark
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/bi-zone/ruwireguard-go/crypto/gost/gost3410"
+
+	"nis-core/internal/crypto"
+	"nis-core/internal/engine"
+	"nis-core/internal/ledger"
+)
+
+type benchEnv struct {
+	g          *crypto.GOSTProvider
+	engine     *engine.SmartContractEngine
+	ledger     *ledger.BadgerLedger
+	issuerPriv *gost3410.PrivateKey
+	oraclePriv *gost3410.PrivateKey
+}
+
+func setupBenchEnv(b *testing.B) *benchEnv {
+	b.Helper()
+
+	g := crypto.NewGOSTProvider()
+
+	issuerPriv, issuerPub, err := g.GenerateKeyPair()
+	if err != nil {
+		b.Fatalf("issuer keypair: %v", err)
+	}
+	oraclePriv, oraclePub, err := g.GenerateKeyPair()
+	if err != nil {
+		b.Fatalf("oracle keypair: %v", err)
+	}
+
+	dir := filepath.Join(b.TempDir(), "bench-db")
+	bl, err := ledger.NewBadgerLedger(dir)
+	if err != nil {
+		b.Fatalf("ledger: %v", err)
+	}
+	b.Cleanup(func() { _ = bl.Close() })
+
+	eng, err := engine.NewSmartContractEngine(bl, g, issuerPub, oraclePub)
+	if err != nil {
+		b.Fatalf("engine: %v", err)
+	}
+
+	return &benchEnv{
+		g:          g,
+		engine:     eng,
+		ledger:     bl,
+		issuerPriv: issuerPriv,
+		oraclePriv: oraclePriv,
+	}
+}
+
+// runOneCycle вЂ” РїРѕР»РЅС‹Р№ С†РёРєР» РѕРґРЅРѕР№ СЃРґРµР»РєРё.
+func runOneCycle(env *benchEnv, dealID, milHash, inn, kadastr string) error {
+	token, err := env.engine.IssueColoredRubles(
+		485_000_000, milHash, inn, kadastr, env.issuerPriv,
+	)
+	if err != nil {
+		return fmt.Errorf("issue: %w", err)
+	}
+	if err := env.engine.LockInEscrow(
+		dealID, token, engine.DefaultLockDuration,
+	); err != nil {
+		return fmt.Errorf("lock: %w", err)
+	}
+	digest := env.g.Streebog256([]byte(dealID + ":" + kadastr + ":true"))
+	oracleSig, err := env.g.SignGOST3410(env.oraclePriv, digest)
+	if err != nil {
+		return fmt.Errorf("sign: %w", err)
+	}
+	if err := env.engine.ProcessRosreestrCallback(
+		dealID, kadastr, true, oracleSig,
+	); err != nil {
+		return fmt.Errorf("callback: %w", err)
+	}
+	return nil
+}
+
+// BenchmarkFullCycle вЂ” РїРѕСЃР»РµРґРѕРІР°С‚РµР»СЊРЅС‹Р№ РїРѕР»РЅС‹Р№ С†РёРєР» СЃРґРµР»РєРё.
+func BenchmarkFullCycle(b *testing.B) {
+	env := setupBenchEnv(b)
+
+	latencies := make([]time.Duration, 0, b.N)
+
+	b.ResetTimer()
+	start := time.Now()
+	for i := 0; i < b.N; i++ {
+		opStart := time.Now()
+
+		dealID := fmt.Sprintf("DEAL-BENCH-%d", i)
+		milHash := fmt.Sprintf("mil-%d", i)
+		kadastr := fmt.Sprintf("77:01:%07d:1001", i%1_000_000)
+
+		if err := runOneCycle(env, dealID, milHash, "7701982341", kadastr); err != nil {
+			b.Fatalf("cycle[%d]: %v", i, err)
+		}
+
+		latencies = append(latencies, time.Since(opStart))
+	}
+	elapsed := time.Since(start)
+	b.StopTimer()
+
+	if b.N < 10 {
+		return // warmup-РїСЂРѕРіРѕРЅ, РѕС‚С‡С‘С‚ РЅРµ РїРµС‡Р°С‚Р°РµРј
+	}
+	report(b, "SEQUENTIAL", len(latencies), elapsed, latencies)
+}
+
+// BenchmarkParallelFullCycle вЂ” РїР°СЂР°Р»Р»РµР»СЊРЅС‹Р№ РїРѕР»РЅС‹Р№ С†РёРєР».
+//
+// РџРѕРґРїРёСЃРё СЃРµСЂРёР°Р»РёР·СѓСЋС‚СЃСЏ РјСЊСЋС‚РµРєСЃРѕРј РІРЅСѓС‚СЂРё GOSTProvider,
+// РїРѕСЌС‚РѕРјСѓ РїР°СЂР°Р»Р»РµР»РёР·Рј РѕРіСЂР°РЅРёС‡РµРЅ. РћСЃРЅРѕРІРЅРѕР№ РІС‹РёРіСЂС‹С€ вЂ” РЅР° I/O Badger.
+func BenchmarkParallelFullCycle(b *testing.B) {
+	env := setupBenchEnv(b)
+
+	const numWorkers = 8
+	opsPerWorker := b.N / numWorkers
+	if opsPerWorker == 0 {
+		opsPerWorker = 1
+	}
+
+	latencies := make([]time.Duration, b.N)
+	var latIdx atomic.Uint64
+	var successCount atomic.Uint64
+
+	var wg sync.WaitGroup
+	b.ResetTimer()
+	start := time.Now()
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < opsPerWorker; i++ {
+				opStart := time.Now()
+
+				dealID := fmt.Sprintf("DEAL-PAR-%d-%d", workerID, i)
+				milHash := fmt.Sprintf("mil-%d-%d", workerID, i)
+				kadastr := fmt.Sprintf("77:01:%07d:1001", (workerID*1000+i)%1_000_000)
+
+				if err := runOneCycle(env, dealID, milHash, "7701982341", kadastr); err != nil {
+					continue
+				}
+				successCount.Add(1)
+
+				idx := latIdx.Add(1) - 1
+				if int(idx) < len(latencies) {
+					latencies[idx] = time.Since(opStart)
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+	b.StopTimer()
+
+	done := int(successCount.Load())
+	if done == 0 {
+		b.Fatal("no successful cycles")
+	}
+	if done < len(latencies) {
+		latencies = latencies[:done]
+	}
+
+	if b.N < 10 {
+		return
+	}
+	report(b, "PARALLEL (8 workers)", done, elapsed, latencies)
+}
+
+// report СЃРѕР±РёСЂР°РµС‚ РјРµС‚СЂРёРєРё Рё РїРµС‡Р°С‚Р°РµС‚ С‚Р°Р±Р»РёС†Сѓ.
+func report(
+	b *testing.B,
+	mode string,
+	count int,
+	elapsed time.Duration,
+	latencies []time.Duration,
+) {
+	b.Helper()
+	if len(latencies) == 0 {
+		b.Fatal("no latencies collected")
+	}
+
+	tps := float64(count) / elapsed.Seconds()
+	b.ReportMetric(tps, "TPS")
+
+	sorted := make([]time.Duration, len(latencies))
+	copy(sorted, latencies)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+
+	p := func(q float64) time.Duration {
+		if len(sorted) == 0 {
+			return 0
+		}
+		idx := int(float64(len(sorted)-1) * q)
+		return sorted[idx]
+	}
+
+	var total time.Duration
+	for _, d := range sorted {
+		total += d
+	}
+	avg := total / time.Duration(len(sorted))
+
+	printReport(mode, count, elapsed, tps, avg, p(0.50), p(0.95), p(0.99), sorted[len(sorted)-1])
+}
+
+// printReport РїРµС‡Р°С‚Р°РµС‚ С‚Р°Р±Р»РёС†Сѓ РІ stdout Рё СЃРѕС…СЂР°РЅСЏРµС‚ РєРѕРїРёСЋ РІ С„Р°Р№Р».
+// РСЃРїРѕР»СЊР·РѕРІР°РЅРёРµ ASCII-СЂР°РјРѕРє РіР°СЂР°РЅС‚РёСЂСѓРµС‚, С‡С‚Рѕ РІС‹РІРѕРґ РЅРµ Р·Р°РІРёСЃРёС‚ РѕС‚
+// РєРѕРґРёСЂРѕРІРєРё РєРѕРЅСЃРѕР»Рё (PowerShell 5.1, cmd.exe, bash вЂ” РІСЃРµ С‡РёС‚Р°СЋС‚
+// РѕРґРёРЅР°РєРѕРІРѕ).
+func printReport(
+	mode string,
+	count int,
+	elapsed time.Duration,
+	tps float64,
+	avg, p50, p95, p99, mx time.Duration,
+) {
+	lines := []string{
+		"",
+		"+----------------------------------------------------------+",
+		fmt.Sprintf("|  BENCHMARK RESULTS: DIGITAL NIS [%s]", padRight(mode, 20)),
+		"+----------------------------------------------------------+",
+		fmt.Sprintf("|  Full deal cycles      : %10d                          |", count),
+		fmt.Sprintf("|  Total time            : %-14v                  |", elapsed.Round(time.Millisecond)),
+		fmt.Sprintf("|  Throughput            : %10.2f TPS                     |", tps),
+		"+----------------------------------------------------------+",
+		"|  Latency (per full cycle)                                |",
+		fmt.Sprintf("|    average : %-14v                              |", avg.Round(time.Microsecond)),
+		fmt.Sprintf("|    p50     : %-14v                              |", p50.Round(time.Microsecond)),
+		fmt.Sprintf("|    p95     : %-14v                              |", p95.Round(time.Microsecond)),
+		fmt.Sprintf("|    p99     : %-14v                              |", p99.Round(time.Microsecond)),
+		fmt.Sprintf("|    max     : %-14v                              |", mx.Round(time.Microsecond)),
+		"+----------------------------------------------------------+",
+		"|  Crypto    : GOST R 34.11-2012 / 34.10-2012              |",
+		"|  Storage   : BadgerDB (embedded, LSM-tree)               |",
+		"+----------------------------------------------------------+",
+		"",
+	}
+
+	// stdout
+	for _, l := range lines {
+		fmt.Fprintln(os.Stdout, l)
+	}
+
+	// С„Р°Р№Р» (UTF-8)
+	if path := os.Getenv("NIS_BENCH_OUT"); path != "" {
+		content := strings.Join(lines, "\n") + "\n"
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "benchmark: write %s: %v\n", path, err)
+		} else {
+			fmt.Fprintf(os.Stderr, "benchmark: results written to %s\n", path)
+		}
+	}
+}
+
+// padRight РґРѕРїРѕР»РЅСЏРµС‚ СЃС‚СЂРѕРєСѓ РїСЂРѕР±РµР»Р°РјРё СЃРїСЂР°РІР° РґРѕ С€РёСЂРёРЅС‹ w.
+func padRight(s string, w int) string {
+	for len(s) < w {
+		s += " "
+	}
+	return s
+}
+
+
+// ============================================
+// FILE: main.go
+// ============================================
+// CLI-СѓС‚РёР»РёС‚Р° Р°СѓРґРёС‚РѕСЂР° В«Р¦РёС„СЂРѕРІРѕР№ РќРРЎВ».
+//
+// РќРµР·Р°РІРёСЃРёРјР°СЏ РїСЂРѕРІРµСЂРєР° С†РµР»РѕСЃС‚РЅРѕСЃС‚Рё СЂРµРµСЃС‚СЂР° СЌСЃРєСЂРѕСѓ-РєРѕРЅС‚СЂР°РєС‚РѕРІ
+// Р±РµР· РґРѕСЃС‚СѓРїР° Рє РїРµСЂСЃРѕРЅР°Р»СЊРЅС‹Рј РґР°РЅРЅС‹Рј РІРѕРµРЅРЅРѕСЃР»СѓР¶Р°С‰РёС….
+// Р Р°Р±РѕС‚Р°РµС‚ РїРѕРІРµСЂС… BadgerDB РІ СЂРµР¶РёРјРµ С‚РѕР»СЊРєРѕ-С‡С‚РµРЅРёРµ.
+//
+// РљРѕРјР°РЅРґС‹:
+//  1. full-audit вЂ” РїРѕСЃС‚СЂРѕРёС‚СЊ Merkle-РґРµСЂРµРІРѕ РїРѕ РІСЃРµРј РєРѕРЅС‚СЂР°РєС‚Р°Рј
+//     Рё РІС‹РІРµСЃС‚Рё РєРѕСЂРЅРµРІРѕР№ С…СЌС€ (РЎС‚СЂРёР±РѕРі-256). В«РЎР»РµРїРѕРєВ» СЃРѕСЃС‚РѕСЏРЅРёСЏ
+//     СЂРµРµСЃС‚СЂР° РґР»СЏ РѕС‚С‡С‘С‚Р° СЂРµРіСѓР»СЏС‚РѕСЂР°.
+//  2. prove <dealID> вЂ” РїРѕСЃС‚СЂРѕРёС‚СЊ РґРѕРєР°Р·Р°С‚РµР»СЊСЃС‚РІРѕ РІРєР»СЋС‡РµРЅРёСЏ
+//     РєРѕРЅРєСЂРµС‚РЅРѕР№ СЃРґРµР»РєРё РІ СЂРµРµСЃС‚СЂ Рё РїСЂРѕРІРµСЂРёС‚СЊ РµРіРѕ. РџРѕР·РІРѕР»СЏРµС‚
+//     РїРѕРґС‚РІРµСЂРґРёС‚СЊ С„Р°РєС‚ СЃРґРµР»РєРё, РЅРµ СЂР°СЃРєСЂС‹РІР°СЏ СЃРѕРґРµСЂР¶РёРјРѕРµ РѕСЃС‚Р°Р»СЊРЅС‹С….
+//
+// РСЃРїРѕР»СЊР·СѓРµС‚ РѕР±С‰РёР№ РїР°РєРµС‚ internal/audit вЂ” С‚РѕС‚ Р¶Рµ, С‡С‚Рѕ Рё СѓР·РµР»,
+// РїРѕСЌС‚РѕРјСѓ РєРѕСЂРЅРµРІРѕР№ С…СЌС€ СЃРѕРІРїР°РґР°РµС‚ СЃ С‚РµРј, С‡С‚Рѕ РѕС‚РґР°С‘С‚
+// GET /api/v1/security/status РЅР° СѓР·Р»Рµ.
+package main
+
+import (
+	"encoding/hex"
+	"errors"
+	"flag"
+	"fmt"
+	"log"
+	"time"
+
+	badger "github.com/dgraph-io/badger/v4"
+
+	"nis-core/internal/audit"
+	"nis-core/internal/crypto"
+	"nis-core/internal/engine"
+	"nis-core/internal/ledger"
+)
+
+// Stats вЂ” СЃРІРѕРґРєР° РїРѕ СЃС‚Р°С‚СѓСЃР°Рј РєРѕРЅС‚СЂР°РєС‚РѕРІ.
+type Stats struct {
+	Total    int
+	Created  int
+	Locked   int
+	Released int
+	Refunded int
+}
+
+func main() {
+	dbPath := flag.String("db", "./data/nis-state", "path to BadgerDB")
+	cmd := flag.String("cmd", "full-audit", "command: full-audit | prove")
+	dealID := flag.String("deal", "", "dealID for prove command")
+	flag.Parse()
+
+	if err := run(*dbPath, *cmd, *dealID); err != nil {
+		log.Fatalf("[auditor] %v", err)
+	}
+}
+
+func run(dbPath, cmd, dealID string) error {
+	g := crypto.NewGOSTProvider()
+
+	opts := badger.DefaultOptions(dbPath).
+		WithLogger(nil).
+		WithLoggingLevel(badger.ERROR).
+		WithValueLogFileSize(64 << 20)
+
+	db, err := badger.Open(opts)
+	if err != nil {
+		return fmt.Errorf("open db: %w", err)
+	}
+	defer db.Close()
+
+	switch cmd {
+	case "full-audit":
+		return fullAudit(g, db)
+	case "prove":
+		if dealID == "" {
+			return errors.New("prove: -deal <dealID> is required")
+		}
+		return prove(g, db, dealID)
+	default:
+		return fmt.Errorf("unknown command %q (use full-audit or prove)", cmd)
+	}
+}
+
+// loadAll С‡РёС‚Р°РµС‚ РІСЃРµ escrow-РєРѕРЅС‚СЂР°РєС‚С‹ РёР· Р‘Р”.
+func loadAll(db *badger.DB) (map[string]*engine.EscrowContract, error) {
+	contracts := make(map[string]*engine.EscrowContract)
+	err := db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+		prefix := []byte(ledger.EscrowKeyPrefix)
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			item := it.Item()
+			key := string(item.Key())
+			dealID := key[len(ledger.EscrowKeyPrefix):]
+
+			var payload []byte
+			if err := item.Value(func(v []byte) error {
+				payload = append([]byte(nil), v...)
+				return nil
+			}); err != nil {
+				return err
+			}
+
+			c, err := engine.DeserializeEscrow(payload)
+			if err != nil {
+				return fmt.Errorf("deserialize %s: %w", dealID, err)
+			}
+			contracts[dealID] = c
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return contracts, nil
+}
+
+// fullAudit СЃС‚СЂРѕРёС‚ РїРѕР»РЅРѕРµ РґРµСЂРµРІРѕ Рё РїРµС‡Р°С‚Р°РµС‚ СЃРІРѕРґРєСѓ.
+func fullAudit(g *crypto.GOSTProvider, db *badger.DB) error {
+	contracts, err := loadAll(db)
+	if err != nil {
+		return err
+	}
+	if len(contracts) == 0 {
+		fmt.Println("Р РµРµСЃС‚СЂ РїСѓСЃС‚ вЂ” РЅРµС‚ РЅРё РѕРґРЅРѕРіРѕ СЌСЃРєСЂРѕСѓ-РєРѕРЅС‚СЂР°РєС‚Р°.")
+		return nil
+	}
+
+	tree, err := audit.BuildTree(g, contracts)
+	if err != nil {
+		return fmt.Errorf("build merkle: %w", err)
+	}
+
+	stats := Stats{Total: len(contracts)}
+	for _, c := range contracts {
+		switch c.Status {
+		case engine.StatusCreated:
+			stats.Created++
+		case engine.StatusLocked:
+			stats.Locked++
+		case engine.StatusReleased:
+			stats.Released++
+		case engine.StatusRefunded:
+			stats.Refunded++
+		}
+	}
+
+	fmt.Println("========================================================")
+	fmt.Println("  РђРЈР”РРў Р Р•Р•РЎРўР Рђ В«Р¦РР¤Р РћР’РђРЇ РќРРЎВ»")
+	fmt.Println("========================================================")
+	fmt.Printf("  Р’СЂРµРјСЏ Р°СѓРґРёС‚Р°       : %s\n",
+		time.Now().UTC().Format(time.RFC3339))
+	fmt.Printf("  Р’СЃРµРіРѕ РєРѕРЅС‚СЂР°РєС‚РѕРІ   : %d\n", stats.Total)
+	fmt.Printf("    CREATED          : %d\n", stats.Created)
+	fmt.Printf("    LOCKED           : %d\n", stats.Locked)
+	fmt.Printf("    RELEASED         : %d\n", stats.Released)
+	fmt.Printf("    REFUNDED         : %d\n", stats.Refunded)
+	fmt.Println("--------------------------------------------------------")
+	fmt.Printf("  РљРѕСЂРЅРµРІРѕР№ С…СЌС€       : %s\n", hex.EncodeToString(tree.Tree.RootHash()))
+	fmt.Printf("  РђР»РіРѕСЂРёС‚Рј           : Р“РћРЎРў Р  34.11-2012 (РЎС‚СЂРёР±РѕРі-256)\n")
+	fmt.Printf("  Р›РёСЃС‚СЊРµРІ РІ РґРµСЂРµРІРµ   : %d\n", tree.Tree.Size())
+	fmt.Println("========================================================")
+	return nil
+}
+
+// prove СЃС‚СЂРѕРёС‚ РґРѕРєР°Р·Р°С‚РµР»СЊСЃС‚РІРѕ РІРєР»СЋС‡РµРЅРёСЏ СЃРґРµР»РєРё Рё РїСЂРѕРІРµСЂСЏРµС‚ РµРіРѕ.
+func prove(g *crypto.GOSTProvider, db *badger.DB, dealID string) error {
+	contracts, err := loadAll(db)
+	if err != nil {
+		return err
+	}
+	if len(contracts) == 0 {
+		return errors.New("СЂРµРµСЃС‚СЂ РїСѓСЃС‚")
+	}
+
+	tree, err := audit.BuildTree(g, contracts)
+	if err != nil {
+		return fmt.Errorf("build merkle: %w", err)
+	}
+
+	idx := tree.IndexOf(dealID)
+	if idx < 0 {
+		return fmt.Errorf("СЃРґРµР»РєР° %q РЅРµ РЅР°Р№РґРµРЅР° РІ СЂРµРµСЃС‚СЂРµ", dealID)
+	}
+
+	proof, err := tree.Tree.Prove(idx)
+	if err != nil {
+		return fmt.Errorf("prove: %w", err)
+	}
+	ok := crypto.VerifyProof(g, tree.Tree.RootHash(), proof)
+
+	rec := contracts[dealID]
+	fmt.Println("========================================================")
+	fmt.Printf("  Р”РћРљРђР—РђРўР•Р›Р¬РЎРўР’Рћ Р’РљР›Р®Р§Р•РќРРЇ РЎР”Р•Р›РљР %s\n", dealID)
+	fmt.Println("========================================================")
+	fmt.Printf("  Р›РёСЃС‚ (leaf hash)   : %s\n", hex.EncodeToString(proof.LeafHash))
+	fmt.Printf("  Р“Р»СѓР±РёРЅР° РґРµСЂРµРІР°     : %d\n", len(proof.Siblings))
+	fmt.Println("  РџСѓС‚СЊ (sibling hashes):")
+	for i, s := range proof.Siblings {
+		side := "СЃРїСЂР°РІР°"
+		if s.IsLeft {
+			side = "СЃР»РµРІР° "
+		}
+		fmt.Printf("    %2d) [%s] %s\n", i+1, side, hex.EncodeToString(s.Hash))
+	}
+	fmt.Println("--------------------------------------------------------")
+	fmt.Printf("  РљРѕСЂРЅРµРІРѕР№ С…СЌС€       : %s\n", hex.EncodeToString(tree.Tree.RootHash()))
+	fmt.Printf("  Р’РµСЂРёС„РёРєР°С†РёСЏ        : %v\n", verdict(ok))
+	fmt.Println("--------------------------------------------------------")
+	fmt.Printf("  РЎРґРµР»РєР°\n")
+	fmt.Printf("    РЎС‚Р°С‚СѓСЃ           : %s\n", rec.Status)
+	fmt.Printf("    РЎСѓРјРјР° (РєРѕРї.)     : %d\n", rec.Token.Amount)
+	fmt.Printf("    РўРѕРєРµРЅ (prefix)   : %s...\n", prefix(rec.Token.TokenID, 16))
+	fmt.Printf("    РљР°РґР°СЃС‚СЂ          : %s\n", rec.Token.CadastralNumber)
+	fmt.Printf("    РЎРѕР·РґР°РЅР°          : %s\n",
+		time.Unix(rec.CreatedAt, 0).UTC().Format(time.RFC3339))
+	fmt.Printf("    РћР±РЅРѕРІР»РµРЅР°        : %s\n",
+		time.Unix(rec.UpdatedAt, 0).UTC().Format(time.RFC3339))
+	fmt.Println("========================================================")
+
+	if !ok {
+		return errors.New("РІРµСЂРёС„РёРєР°С†РёСЏ РґРѕРєР°Р·Р°С‚РµР»СЊСЃС‚РІР° РЅРµ РїСЂРѕС€Р»Р°")
+	}
+	return nil
+}
+
+func verdict(ok bool) string {
+	if ok {
+		return "РџРћР”РўР’Р•Р Р–Р”Р•РќРћ (proof valid)"
+	}
+	return "РћРўРљР›РћРќР•РќРћ (proof invalid)"
+}
+
+func prefix(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+
+// ============================================
+// FILE: handlers.go
+// ============================================
+// HTTP-РѕР±СЂР°Р±РѕС‚С‡РёРєРё РѕСЃРЅРѕРІРЅРѕРіРѕ СѓР·Р»Р° В«Р¦РёС„СЂРѕРІРѕР№ РќРРЎВ».
+package main
+
+import (
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"nis-core/internal/app"
+	"nis-core/internal/audit"
+	"nis-core/internal/engine"
+)
+
+// handlers вЂ” HTTP-СЃР»РѕР№ РїРѕРІРµСЂС… App.
+type handlers struct {
+	app *app.App
+}
+
+// writeJSON вЂ” СѓС‚РёР»РёС‚Р° РґР»СЏ РѕС‚РґР°С‡Рё JSON.
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		// РќР° СЌС‚РѕРј СЌС‚Р°РїРµ Р·Р°РіРѕР»РѕРІРєРё СѓР¶Рµ РѕС‚РїСЂР°РІР»РµРЅС‹, Р»РѕРіРёСЂСѓРµРј РІ stderr.
+		fmt.Fprintf(w, `{"error":"encode failed"}`)
+	}
+}
+
+// writeErr вЂ” СЃС‚Р°РЅРґР°СЂС‚РёР·РёСЂРѕРІР°РЅРЅС‹Р№ РѕС‚РєР°Р·.
+func writeErr(w http.ResponseWriter, status int, err error) {
+	writeJSON(w, status, map[string]string{"error": err.Error()})
+}
+
+// mapEngineErr вЂ” РїРµСЂРµРІРѕРґРёС‚ sentinel-РѕС€РёР±РєРё РґРІРёР¶РєР° РІ HTTP-СЃС‚Р°С‚СѓСЃС‹.
+func mapEngineErr(err error) int {
+	switch {
+	case errors.Is(err, engine.ErrNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, engine.ErrConflict):
+		return http.StatusConflict
+	case errors.Is(err, engine.ErrInvalidArgument):
+		return http.StatusBadRequest
+	case errors.Is(err, engine.ErrInvalidState):
+		return http.StatusConflict
+	case errors.Is(err, engine.ErrTokenMisuse),
+		errors.Is(err, engine.ErrIssuerSigInvalid),
+		errors.Is(err, engine.ErrOracleSigInvalid):
+		return http.StatusForbidden
+	case errors.Is(err, engine.ErrContractExpired):
+		return http.StatusGone
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+// GET /healthz
+func (h *handlers) healthz(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":    "ok",
+		"node_id":   h.app.Config.NodeID,
+		"demo_mode": h.app.Config.DemoMode,
+		"time":      time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// GET /api/v1/escrow/{dealID}
+func (h *handlers) getEscrow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	dealID := strings.TrimPrefix(r.URL.Path, "/api/v1/escrow/")
+	if dealID == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("dealID is required"))
+		return
+	}
+	c, err := h.app.Engine.GetEscrow(dealID)
+	if err != nil {
+		writeErr(w, mapEngineErr(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, c)
+}
+
+// issueRequest вЂ” С‚РµР»Рѕ POST /api/v1/issue.
+type issueRequest struct {
+	Amount       uint64 `json:"amount"`
+	MilitaryHash string `json:"military_hash"`
+	DeveloperINN string `json:"developer_inn"`
+	Kadastr      string `json:"kadastr"`
+}
+
+// POST /api/v1/issue
+//
+// РўРѕР»СЊРєРѕ РІ demo-СЂРµР¶РёРјРµ: РёСЃРїРѕР»СЊР·СѓРµС‚ РїСЂРёРІР°С‚РЅС‹Р№ РєР»СЋС‡ СЌРјРёС‚РµРЅС‚Р°,
+// С…СЂР°РЅСЏС‰РёР№СЃСЏ РІ РїСЂРѕС†РµСЃСЃРµ. Р’ РїСЂРѕРґР°РєС€РµРЅРµ СЌРјРёСЃСЃРёСЏ РёРґС‘С‚ СЃ РѕС‚РґРµР»СЊРЅРѕРіРѕ
+// СѓР·Р»Р° СЃ HSM.
+func (h *handlers) issue(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if !h.app.Config.DemoMode || h.app.IssuerPriv == nil {
+		writeErr(w, http.StatusForbidden,
+			errors.New("issue endpoint requires demo_mode with issuer key"))
+		return
+	}
+	var req issueRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid JSON: %w", err))
+		return
+	}
+	token, err := h.app.Engine.IssueColoredRubles(
+		req.Amount, req.MilitaryHash, req.DeveloperINN, req.Kadastr,
+		h.app.IssuerPriv,
+	)
+	if err != nil {
+		writeErr(w, mapEngineErr(err), err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, token)
+}
+
+// lockRequest вЂ” С‚РµР»Рѕ POST /api/v1/lock.
+type lockRequest struct {
+	DealID      string                  `json:"deal_id"`
+	Token       engine.DigitalNISRubles `json:"token"`
+	LockSeconds int64                   `json:"lock_seconds"`
+}
+
+// POST /api/v1/lock
+func (h *handlers) lock(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req lockRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid JSON: %w", err))
+		return
+	}
+	dur := time.Duration(req.LockSeconds) * time.Second
+	if dur <= 0 {
+		dur = engine.DefaultLockDuration
+	}
+	if err := h.app.Engine.LockInEscrow(req.DealID, &req.Token, dur); err != nil {
+		writeErr(w, mapEngineErr(err), err)
+		return
+	}
+	c, _ := h.app.Engine.GetEscrow(req.DealID)
+	writeJSON(w, http.StatusOK, c)
+}
+
+// callbackRequest вЂ” С‚РµР»Рѕ POST /api/v1/rosreestr/callback.
+type callbackRequest struct {
+	DealID    string `json:"deal_id"`
+	Kadastr   string `json:"kadastr"`
+	Success   bool   `json:"success"`
+	Signature []byte `json:"signature"` // base64 РІ JSON
+}
+
+// POST /api/v1/rosreestr/callback
+func (h *handlers) rosreestrCallback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req callbackRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid JSON: %w", err))
+		return
+	}
+	err := h.app.Engine.ProcessRosreestrCallback(
+		req.DealID, req.Kadastr, req.Success, req.Signature,
+	)
+	if err != nil && !errors.Is(err, engine.ErrContractExpired) {
+		writeErr(w, mapEngineErr(err), err)
+		return
+	}
+	c, gerr := h.app.Engine.GetEscrow(req.DealID)
+	if gerr != nil {
+		writeErr(w, mapEngineErr(gerr), gerr)
+		return
+	}
+	// ErrContractExpired вЂ” РЅРµ РѕС€РёР±РєР° API, Р° СЃРёРіРЅР°Р»: РєРѕРЅС‚СЂР°РєС‚ РїРµСЂРµС€С‘Р»
+	// РІ Refunded. РћС‚РґР°С‘Рј СЃРѕСЃС‚РѕСЏРЅРёРµ СЃ 200 Рё РїРѕР»РµРј "expired".
+	resp := map[string]any{"contract": c}
+	if errors.Is(err, engine.ErrContractExpired) {
+		resp["expired"] = true
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// demoRunRequest вЂ” С‚РµР»Рѕ POST /api/v1/demo/run.
+type demoRunRequest struct {
+	DealID       string `json:"deal_id"`
+	Amount       uint64 `json:"amount"`
+	MilitaryHash string `json:"military_hash"`
+	DeveloperINN string `json:"developer_inn"`
+	Kadastr      string `json:"kadastr"`
+	LockSeconds  int64  `json:"lock_seconds,omitempty"`
+	Reject       bool   `json:"reject,omitempty"`
+}
+
+// demoRunResponse вЂ” СЂРµР·СѓР»СЊС‚Р°С‚ РїРѕР»РЅРѕРіРѕ demo-РїСЂРѕРіРѕРЅР°.
+type demoRunResponse struct {
+	DealID          string                  `json:"deal_id"`
+	Token           engine.DigitalNISRubles `json:"token"`
+	OracleSignature string                  `json:"oracle_signature"` // base64
+	ContractFinal   *engine.EscrowContract  `json:"contract_final"`
+	Expired         bool                    `json:"expired,omitempty"`
+}
+
+// POST /api/v1/demo/run
+//
+// РџСЂРѕРіРѕРЅСЏРµС‚ РїРѕР»РЅС‹Р№ С†РёРєР» СЃРґРµР»РєРё Р±РµР· РІРЅРµС€РЅРёС… Р·Р°РІРёСЃРёРјРѕСЃС‚РµР№:
+// СЌРјРёСЃСЃРёСЏ в†’ Р±Р»РѕРєРёСЂРѕРІРєР° в†’ РїРѕРґРїРёСЃСЊ РѕСЂР°РєСѓР»Р° в†’ РєРѕР»Р±СЌРє.
+//
+// Р”РѕСЃС‚СѓРїРµРЅ С‚РѕР»СЊРєРѕ РІ demo_mode, РєРѕРіРґР° Сѓ СѓР·Р»Р° РµСЃС‚СЊ РїСЂРёРІР°С‚РЅС‹Р№ РєР»СЋС‡
+// РѕСЂР°РєСѓР»Р°. Р’ production СЌС‚РѕС‚ endpoint РѕС‚РєР»СЋС‡С‘РЅ (403).
+func (h *handlers) demoRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if !h.app.Config.DemoMode {
+		writeErr(w, http.StatusForbidden,
+			errors.New("demo endpoint requires demo_mode: true"))
+		return
+	}
+	if h.app.IssuerPriv == nil {
+		writeErr(w, http.StatusForbidden,
+			errors.New("demo endpoint requires issuer private key"))
+		return
+	}
+	if h.app.OraclePriv == nil {
+		writeErr(w, http.StatusForbidden,
+			errors.New("demo endpoint requires oracle private key"))
+		return
+	}
+
+	var req demoRunRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid JSON: %w", err))
+		return
+	}
+	if req.DealID == "" || req.Amount == 0 ||
+		req.MilitaryHash == "" || req.DeveloperINN == "" || req.Kadastr == "" {
+		writeErr(w, http.StatusBadRequest,
+			errors.New("deal_id, amount, military_hash, developer_inn, kadastr required"))
+		return
+	}
+
+	// 1. Р­РјРёСЃСЃРёСЏ.
+	token, err := h.app.Engine.IssueColoredRubles(
+		req.Amount, req.MilitaryHash, req.DeveloperINN, req.Kadastr,
+		h.app.IssuerPriv,
+	)
+	if err != nil {
+		writeErr(w, mapEngineErr(err), err)
+		return
+	}
+
+	// 2. Р‘Р»РѕРєРёСЂРѕРІРєР°.
+	lockDur := time.Duration(req.LockSeconds) * time.Second
+	if lockDur <= 0 {
+		lockDur = engine.DefaultLockDuration
+	}
+	if err := h.app.Engine.LockInEscrow(req.DealID, token, lockDur); err != nil {
+		writeErr(w, mapEngineErr(err), err)
+		return
+	}
+
+	// 3. Р›РѕРєР°Р»СЊРЅР°СЏ РїРѕРґРїРёСЃСЊ РѕС‚РІРµС‚Р° РѕСЂР°РєСѓР»Р° (РІ РїСЂРѕРґРµ вЂ” РїСЂРёС…РѕРґРёС‚ РїРѕ HTTPS РѕС‚ РѕСЂР°РєСѓР»Р°).
+	success := !req.Reject
+	digest := h.app.Crypto.OracleResponseDigest(req.DealID, req.Kadastr, success)
+	sig, err := h.app.Crypto.SignGOST3410(h.app.OraclePriv, digest)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError,
+			fmt.Errorf("sign oracle response: %w", err))
+		return
+	}
+
+	// 4. РљРѕР»Р±СЌРє.
+	cbErr := h.app.Engine.ProcessRosreestrCallback(
+		req.DealID, req.Kadastr, success, sig,
+	)
+	expired := false
+	if cbErr != nil {
+		if errors.Is(cbErr, engine.ErrContractExpired) {
+			expired = true
+		} else {
+			writeErr(w, mapEngineErr(cbErr), cbErr)
+			return
+		}
+	}
+
+	// 5. Р¤РёРЅР°Р»СЊРЅРѕРµ СЃРѕСЃС‚РѕСЏРЅРёРµ.
+	final, err := h.app.Engine.GetEscrow(req.DealID)
+	if err != nil {
+		writeErr(w, mapEngineErr(err), err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, demoRunResponse{
+		DealID:          req.DealID,
+		Token:           *token,
+		OracleSignature: base64.StdEncoding.EncodeToString(sig),
+		ContractFinal:   final,
+		Expired:         expired,
+	})
+}
+
+// securityStatusResponse вЂ” РѕС‚РІРµС‚ GET /api/v1/security/status.
+type securityStatusResponse struct {
+	NodeID           string `json:"node_id"`
+	DemoMode         bool   `json:"demo_mode"`
+	TotalContracts   int    `json:"total_contracts"`
+	Released         int    `json:"released"`
+	Refunded         int    `json:"refunded"`
+	Locked           int    `json:"locked"`
+	MerkleRoot       string `json:"merkle_root"`
+	MerkleLeaves     int    `json:"merkle_leaves"`
+	OracleConfigured bool   `json:"oracle_configured"`
+	OracleTLS        bool   `json:"oracle_tls"`
+	Timestamp        int64  `json:"timestamp"`
+}
+
+// GET /api/v1/security/status
+//
+// Р’РѕР·РІСЂР°С‰Р°РµС‚ СЃРІРѕРґРєСѓ СЃРѕСЃС‚РѕСЏРЅРёСЏ СЂРµРµСЃС‚СЂР° Рё РєРѕРЅС‚СѓСЂР° Р±РµР·РѕРїР°СЃРЅРѕСЃС‚Рё:
+// РєРѕР»РёС‡РµСЃС‚РІРѕ РєРѕРЅС‚СЂР°РєС‚РѕРІ РїРѕ СЃС‚Р°С‚СѓСЃР°Рј, РєРѕСЂРЅРµРІРѕР№ С…СЌС€ Merkle-РґРµСЂРµРІР°
+// (РЎС‚СЂРёР±РѕРі-256), СЃРѕСЃС‚РѕСЏРЅРёРµ mTLS-СЃРѕРµРґРёРЅРµРЅРёСЏ СЃ РѕСЂР°РєСѓР»РѕРј.
+//
+// РСЃРїРѕР»СЊР·СѓРµС‚СЃСЏ РґР°С€Р±РѕСЂРґРѕРј РґР»СЏ РїР°РЅРµР»Рё В«РљРѕРЅС‚СѓСЂ Р±РµР·РѕРїР°СЃРЅРѕСЃС‚РёВ».
+func (h *handlers) securityStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+
+	contracts := make(map[string]*engine.EscrowContract)
+	err := h.app.Ledger.IterateEscrows(
+		func(dealID string, c *engine.EscrowContract) error {
+			contracts[dealID] = c
+			return nil
+		},
+	)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	stats := securityStatusResponse{
+		NodeID:           h.app.Config.NodeID,
+		DemoMode:         h.app.Config.DemoMode,
+		TotalContracts:   len(contracts),
+		OracleConfigured: h.app.Config.OracleURL != "",
+		OracleTLS:        h.app.Config.OracleTLS.Enabled,
+		Timestamp:        time.Now().Unix(),
+	}
+
+	for _, c := range contracts {
+		switch c.Status {
+		case engine.StatusReleased:
+			stats.Released++
+		case engine.StatusRefunded:
+			stats.Refunded++
+		case engine.StatusLocked:
+			stats.Locked++
+		}
+	}
+
+	if len(contracts) > 0 {
+		tree, err := audit.BuildTree(h.app.Crypto, contracts)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError,
+				fmt.Errorf("build merkle: %w", err))
+			return
+		}
+		stats.MerkleRoot = hex.EncodeToString(tree.Tree.RootHash())
+		stats.MerkleLeaves = tree.Tree.Size()
+	}
+
+	writeJSON(w, http.StatusOK, stats)
+}
+
+
+// ============================================
+// FILE: main.go
+// ============================================
+// РћСЃРЅРѕРІРЅРѕР№ СѓР·РµР» РїР»Р°С‚С„РѕСЂРјС‹ В«Р¦РёС„СЂРѕРІР°СЏ РќРРЎВ».
+//
+// Р РµР¶РёРјС‹ СЂР°Р±РѕС‚С‹:
+//   - РѕР±С‹С‡РЅС‹Р№: РїРѕРґРЅРёРјР°РµС‚ HTTP API, Р¶РґС‘С‚ РІС…РѕРґСЏС‰РёС… Р·Р°РїСЂРѕСЃРѕРІ;
+//   - -demo:   РїСЂРѕРіРѕРЅСЏРµС‚ СЃРєРІРѕР·РЅРѕР№ СЃС†РµРЅР°СЂРёР№ (СЌРјРёСЃСЃРёСЏ в†’ Р±Р»РѕРєРёСЂРѕРІРєР°
+//     в†’ РѕС‚РІРµС‚ РѕСЂР°РєСѓР»Р° в†’ released) Рё Р·Р°РІРµСЂС€Р°РµС‚СЃСЏ.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"nis-core/internal/app"
+	"nis-core/internal/engine"
+	"nis-core/internal/oracle"
+)
+
+func main() {
+	configPath := flag.String("config", "configs/node-smolensk.yaml", "path to YAML config")
+	demo := flag.Bool("demo", false, "run end-to-end demo scenario and exit")
+	apiOverride := flag.String("api", "", "override api_addr")
+	flag.Parse()
+
+	cfg, err := app.LoadConfig(*configPath)
+	if err != nil {
+		log.Fatalf("[nis-node] %v", err)
+	}
+	if *apiOverride != "" {
+		cfg.APIAddr = *apiOverride
+	}
+
+	a, err := app.New(cfg)
+	if err != nil {
+		log.Fatalf("[nis-node] %v", err)
+	}
+	defer a.Close()
+
+	log.Printf("[nis-node] started: node_id=%s db=%s demo_mode=%v api=%s",
+		cfg.NodeID, cfg.DBPath, cfg.DemoMode, cfg.APIAddr)
+
+	if *demo {
+		if err := runDemo(a); err != nil {
+			log.Fatalf("[nis-node] demo: %v", err)
+		}
+		return
+	}
+
+	if err := runServer(a); err != nil {
+		log.Fatalf("[nis-node] server: %v", err)
+	}
+}
+
+// runDemo РїСЂРѕРіРѕРЅСЏРµС‚ СЃРєРІРѕР·РЅРѕР№ СЃС†РµРЅР°СЂРёР№.
+//
+// Р•СЃР»Рё РІ РєРѕРЅС„РёРіРµ Р·Р°РґР°РЅ oracle_url вЂ” СѓР·РµР» РґРµР№СЃС‚РІРёС‚РµР»СЊРЅРѕ РІС‹Р·С‹РІР°РµС‚
+// РѕСЂР°РєСѓР» РїРѕ HTTP, Рё РѕС‚РІРµС‚ РїСЂРёС…РѕРґРёС‚ СЃ РЅР°СЃС‚РѕСЏС‰РµР№ Р“РћРЎРў-РїРѕРґРїРёСЃСЊСЋ.
+// Р•СЃР»Рё РЅРµС‚ вЂ” СѓР·РµР» РїРѕРґРїРёСЃС‹РІР°РµС‚ РѕС‚РІРµС‚ Р»РѕРєР°Р»СЊРЅРѕ РєР»СЋС‡РѕРј РёР· demo_mode.
+func runDemo(a *app.App) error {
+	if !a.Config.DemoMode {
+		return errors.New("demo requires demo_mode: true in config")
+	}
+
+	const (
+		inn     = "7701982341"
+		kadastr = "77:01:0001001:102"
+		milHash = "mil-hash-demo"
+		amount  = uint64(485_000_000)
+	)
+
+	// РљР°Р¶РґС‹Р№ РїСЂРѕРіРѕРЅ demo СЃРѕР·РґР°С‘С‚ РЅРѕРІСѓСЋ СЃРґРµР»РєСѓ, С‡С‚РѕР±С‹ РјРѕР¶РЅРѕ Р±С‹Р»Рѕ
+	// Р·Р°РїСѓСЃРєР°С‚СЊ СЃС†РµРЅР°СЂРёР№ РјРЅРѕРіРѕРєСЂР°С‚РЅРѕ РЅР° РѕРґРЅРѕР№ Рё С‚РѕР№ Р¶Рµ Р‘Р”.
+	dealID := fmt.Sprintf("DEAL-DEMO-%d", time.Now().Unix())
+
+	fmt.Println("========== Р”Р•РњРћ-РЎР¦Р•РќРђР РР™ В«Р¦РР¤Р РћР’РђРЇ РќРРЎВ» ==========")
+
+	// 1. Р­РјРёСЃСЃРёСЏ.
+	log.Printf("[demo] 1/5 issue: amount=%d kop, inn=%s, kadastr=%s",
+		amount, inn, kadastr)
+	token, err := a.Engine.IssueColoredRubles(
+		amount, milHash, inn, kadastr, a.IssuerPriv,
+	)
+	if err != nil {
+		return fmt.Errorf("issue: %w", err)
+	}
+	log.Printf("[demo]     token_id=%s... color_tag=%s...",
+		prefix(token.TokenID, 16), prefix(token.TargetColorTag, 16))
+
+	// 2. Р‘Р»РѕРєРёСЂРѕРІРєР°.
+	log.Printf("[demo] 2/5 lock in escrow: deal=%s timeout=%v",
+		dealID, engine.DefaultLockDuration)
+	if err := a.Engine.LockInEscrow(dealID, token, engine.DefaultLockDuration); err != nil {
+		return fmt.Errorf("lock: %w", err)
+	}
+
+	// 3. РџРѕР»СѓС‡Р°РµРј РїРѕРґРїРёСЃСЊ РѕСЂР°РєСѓР»Р° РЅР° success=true.
+	log.Printf("[demo] 3/5 obtain oracle signature (success=true)")
+	var oracleSig []byte
+	if a.Oracle != nil {
+		log.Printf("[demo]     calling oracle over HTTP: %s", a.Config.OracleURL)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		resp, err := a.Oracle.Register(ctx, &oracle.RegisterRequest{
+			DealID: dealID, Kadastr: kadastr,
+		})
+		if err != nil {
+			return fmt.Errorf("oracle call: %w", err)
+		}
+		if !resp.Success {
+			return errors.New("oracle rejected registration")
+		}
+		oracleSig = resp.Signature
+	} else {
+		log.Printf("[demo]     oracle_url not set, signing locally with demo key")
+		digest := a.Crypto.Streebog256([]byte(dealID + ":" + kadastr + ":true"))
+		oracleSig, err = a.Crypto.SignGOST3410(a.OraclePriv, digest)
+		if err != nil {
+			return fmt.Errorf("sign oracle: %w", err)
+		}
+	}
+	log.Printf("[demo]     signature=%d bytes", len(oracleSig))
+
+	// 4. РћР±СЂР°Р±Р°С‚С‹РІР°РµРј РєРѕР»Р±СЌРє.
+	log.Printf("[demo] 4/5 process rosreestr callback")
+	if err := a.Engine.ProcessRosreestrCallback(dealID, kadastr, true, oracleSig); err != nil {
+		return fmt.Errorf("callback: %w", err)
+	}
+
+	// 5. Р§РёС‚Р°РµРј С„РёРЅР°Р»СЊРЅРѕРµ СЃРѕСЃС‚РѕСЏРЅРёРµ.
+	log.Printf("[demo] 5/5 read final state")
+	c, err := a.Engine.GetEscrow(dealID)
+	if err != nil {
+		return fmt.Errorf("get: %w", err)
+	}
+
+	fmt.Println("=================================================")
+	fmt.Printf("  РЎС‚Р°С‚СѓСЃ РєРѕРЅС‚СЂР°РєС‚Р° : %s\n", c.Status)
+	fmt.Printf("  DealID           : %s\n", c.DealID)
+	fmt.Printf("  РЎСѓРјРјР°            : %d kop (%.2f СЂСѓР±)\n", c.Token.Amount, float64(c.Token.Amount)/100)
+	fmt.Printf("  РљР°РґР°СЃС‚СЂ          : %s\n", c.Token.CadastralNumber)
+	fmt.Printf("  Settlement TX    : %s\n", prefix(c.SettlementTxID, 24))
+	fmt.Printf("  РЎРѕР·РґР°РЅ           : %s\n", time.Unix(c.CreatedAt, 0).UTC().Format(time.RFC3339))
+	fmt.Printf("  РћР±РЅРѕРІР»С‘РЅ         : %s\n", time.Unix(c.UpdatedAt, 0).UTC().Format(time.RFC3339))
+	fmt.Println("=================================================")
+	return nil
+}
+
+func runServer(a *app.App) error {
+	h := &handlers{app: a}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", h.healthz)
+	mux.HandleFunc("/api/v1/escrow/", h.getEscrow)
+	mux.HandleFunc("/api/v1/issue", h.issue)
+	mux.HandleFunc("/api/v1/lock", h.lock)
+	mux.HandleFunc("/api/v1/rosreestr/callback", h.rosreestrCallback)
+	mux.HandleFunc("/api/v1/demo/run", h.demoRun)
+	mux.HandleFunc("/api/v1/security/status", h.securityStatus)
+
+	srv := &http.Server{
+		Addr:              a.Config.APIAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		log.Printf("[nis-node] HTTP API listening on %s", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("[nis-node] listen: %v", err)
+		}
+	}()
+
+	<-stop
+	log.Println("[nis-node] shutdown signal received")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return srv.Shutdown(ctx)
+}
+
+// prefix РІРѕР·РІСЂР°С‰Р°РµС‚ РїРµСЂРІС‹Рµ n СЃРёРјРІРѕР»РѕРІ СЃС‚СЂРѕРєРё. Р‘РµР·РѕРїР°СЃРЅРѕ РґР»СЏ РєРѕСЂРѕС‚РєРёС… СЃС‚СЂРѕРє.
+func prefix(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+
+// ============================================
+// FILE: main.go
+// ============================================
+// РЎРµСЂРІРёСЃ-СЌРјСѓР»СЏС‚РѕСЂ РѕСЂР°РєСѓР»Р° Р РѕСЃСЂРµРµСЃС‚СЂР°.
+//
+// РџРѕРґРґРµСЂР¶РёРІР°РµС‚ РґРІР° СЂРµР¶РёРјР° С‚СЂР°РЅСЃРїРѕСЂС‚Р°:
+//   - HTTP (РґР»СЏ Р±С‹СЃС‚СЂРѕРіРѕ Р»РѕРєР°Р»СЊРЅРѕРіРѕ РїСЂРѕС‚РѕС‚РёРїР°);
+//   - HTTPS СЃ mTLS (РґРІСѓСЃС‚РѕСЂРѕРЅРЅСЏСЏ Р°СѓС‚РµРЅС‚РёС„РёРєР°С†РёСЏ, РґР»СЏ РґРµРјРѕРЅСЃС‚СЂР°С†РёРё
+//     Р·Р°С‰РёС‰С‘РЅРЅРѕРіРѕ РєРѕРЅС‚СѓСЂР°).
+//
+// Р РµР¶РёРј РІС‹Р±РёСЂР°РµС‚СЃСЏ С‡РµСЂРµР· СЃРµРєС†РёСЋ tls РІ РєРѕРЅС„РёРіРµ.
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/bi-zone/ruwireguard-go/crypto/gost/gost3410"
+
+	"nis-core/internal/crypto"
+	"nis-core/internal/oracle"
+)
+
+// Config вЂ” РєРѕРЅС„РёРіСѓСЂР°С†РёСЏ СЃРµСЂРІРёСЃР°-СЌРјСѓР»СЏС‚РѕСЂР°.
+type Config struct {
+	ListenAddr        string  `yaml:"listen_addr"`
+	PrivateKeyHex     string  `yaml:"private_key_hex"`
+	GenerateIfMissing bool    `yaml:"generate_if_missing"`
+	LogRequests       bool    `yaml:"log_requests"`
+	TLS               TLSConf `yaml:"tls"`
+}
+
+// TLSConf вЂ” РЅР°СЃС‚СЂРѕР№РєРё mTLS-С‚СЂР°РЅСЃРїРѕСЂС‚Р°.
+type TLSConf struct {
+	Enabled        bool   `yaml:"enabled"`
+	CACertPath     string `yaml:"ca_cert_path"`
+	ServerCertPath string `yaml:"server_cert_path"`
+	ServerKeyPath  string `yaml:"server_key_path"`
+	GenerateIfMiss bool   `yaml:"generate_if_missing"`
+	CertDir        string `yaml:"cert_dir"`
+}
+
+func loadConfig(path string) (*Config, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	var cfg Config
+	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	if cfg.ListenAddr == "" {
+		cfg.ListenAddr = ":8081"
+	}
+	if cfg.TLS.Enabled && cfg.TLS.CertDir == "" {
+		cfg.TLS.CertDir = "./certs"
+	}
+	return &cfg, nil
+}
+
+// Server вЂ” HTTP-РѕР±СЂР°Р±РѕС‚С‡РёРє РѕСЂР°РєСѓР»Р°.
+type Server struct {
+	g         *crypto.GOSTProvider
+	priv      *gost3410.PrivateKey
+	pub       *gost3410.PublicKey
+	logReqs   bool
+	alwaysRej bool
+
+	requestsTotal atomic.Uint64
+	requestsOK    atomic.Uint64
+	requestsRej   atomic.Uint64
+}
+
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.requestsTotal.Add(1)
+
+	var req oracle.RegisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.DealID == "" || req.Kadastr == "" {
+		http.Error(w, "deal_id and kadastr are required", http.StatusBadRequest)
+		return
+	}
+
+	success := !s.alwaysRej
+	digest := s.g.OracleResponseDigest(req.DealID, req.Kadastr, success)
+	sig, err := s.g.SignGOST3410(s.priv, digest)
+	if err != nil {
+		http.Error(w, "sign: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp := oracle.RegisterResponse{
+		DealID:    req.DealID,
+		Kadastr:   req.Kadastr,
+		Success:   success,
+		Signature: sig,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("[oracle] encode response: %v", err)
+	}
+
+	if success {
+		s.requestsOK.Add(1)
+	} else {
+		s.requestsRej.Add(1)
+	}
+	if s.logReqs {
+		log.Printf("[oracle] deal=%s kadastr=%s success=%v",
+			req.DealID, req.Kadastr, success)
+	}
+}
+
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "ok total=%d ok=%d rejected=%d\n",
+		s.requestsTotal.Load(), s.requestsOK.Load(), s.requestsRej.Load())
+}
+
+func resolveKeypair(
+	g *crypto.GOSTProvider,
+	privHex string,
+	generate bool,
+) (*gost3410.PrivateKey, *gost3410.PublicKey, error) {
+	if privHex == "" {
+		if !generate {
+			return nil, nil, errors.New(
+				"private_key_hex is empty and generate_if_missing is false")
+		}
+		priv, pub, err := g.GenerateKeyPair()
+		if err != nil {
+			return nil, nil, err
+		}
+		log.Printf("[oracle] generated private: %s", hex.EncodeToString(priv.Raw()))
+		log.Printf("[oracle] generated public : %s", hex.EncodeToString(pub.Raw()))
+		return priv, pub, nil
+	}
+	raw, err := hex.DecodeString(privHex)
+	if err != nil {
+		return nil, nil, fmt.Errorf("decode private_key_hex: %w", err)
+	}
+	priv, err := g.NewPrivateKeyFromRaw(raw)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse private key: %w", err)
+	}
+	pub, err := priv.PublicKey()
+	if err != nil {
+		return nil, nil, fmt.Errorf("derive public key: %w", err)
+	}
+	log.Printf("[oracle] public key: %s", hex.EncodeToString(pub.Raw()))
+	return priv, pub, nil
+}
+
+// buildTLSConfig РіРѕС‚РѕРІРёС‚ tls.Config СЃ RequireAndVerifyClientCert.
+// РЎРµСЂС‚РёС„РёРєР°С‚С‹ РіРµРЅРµСЂРёСЂСѓСЋС‚СЃСЏ РїСЂРё РїРµСЂРІРѕРј Р·Р°РїСѓСЃРєРµ, РµСЃР»Рё РёС… РЅРµС‚.
+func buildTLSConfig(cfg TLSConf) (*tls.Config, error) {
+	// РџСЂРѕРІРµСЂСЏРµРј РЅР°Р»РёС‡РёРµ СЃРµСЂС‚РёС„РёРєР°С‚РѕРІ, РїСЂРё РЅРµРѕР±С…РѕРґРёРјРѕСЃС‚Рё вЂ” РіРµРЅРµСЂРёСЂСѓРµРј.
+	if _, err := os.Stat(cfg.CACertPath); os.IsNotExist(err) {
+		if !cfg.GenerateIfMiss {
+			return nil, fmt.Errorf("ca cert not found at %s", cfg.CACertPath)
+		}
+		log.Printf("[oracle] generating self-signed cert bundle in %s", cfg.CertDir)
+		bundle, err := oracle.GenerateCertBundle(cfg.CertDir)
+		if err != nil {
+			return nil, fmt.Errorf("generate certs: %w", err)
+		}
+		// Р•СЃР»Рё РїСѓС‚Рё РІ РєРѕРЅС„РёРіРµ РЅРµ СЃРѕРІРїР°РґР°СЋС‚ СЃ РґРµС„РѕР»С‚РЅС‹РјРё вЂ” РїРµСЂРµР·Р°РїРёС€РµРј.
+		cfg.CACertPath = bundle.CAPath
+		cfg.ServerCertPath = bundle.ServerCertPath
+		cfg.ServerKeyPath = bundle.ServerKeyPath
+		log.Printf("[oracle] certs generated:\n  CA:     %s\n  server: %s\n  key:    %s",
+			bundle.CAPath, bundle.ServerCertPath, bundle.ServerKeyPath)
+		log.Printf("[oracle] client cert (for nis-node): %s / %s",
+			bundle.ClientCertPath, bundle.ClientKeyPath)
+	}
+
+	caPEM, err := os.ReadFile(cfg.CACertPath)
+	if err != nil {
+		return nil, fmt.Errorf("read ca: %w", err)
+	}
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caPEM) {
+		return nil, errors.New("ca.crt has no valid certificates")
+	}
+
+	serverCert, err := tls.LoadX509KeyPair(cfg.ServerCertPath, cfg.ServerKeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load server pair: %w", err)
+	}
+
+	return &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{serverCert},
+		ClientCAs:    caPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+	}, nil
+}
+
+func main() {
+	configPath := flag.String("config", "configs/oracle-mock.yaml", "path to YAML config")
+	listenOverride := flag.String("listen", "", "override listen address")
+	rejectAll := flag.Bool("reject", false, "always reject registrations")
+	flag.Parse()
+
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		log.Fatalf("[oracle] %v", err)
+	}
+	if *listenOverride != "" {
+		cfg.ListenAddr = *listenOverride
+	}
+
+	g := crypto.NewGOSTProvider()
+	priv, pub, err := resolveKeypair(g, cfg.PrivateKeyHex, cfg.GenerateIfMissing)
+	if err != nil {
+		log.Fatalf("[oracle] keys: %v", err)
+	}
+
+	srv := &Server{
+		g:         g,
+		priv:      priv,
+		pub:       pub,
+		logReqs:   cfg.LogRequests,
+		alwaysRej: *rejectAll,
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/register", srv.handleRegister)
+	mux.HandleFunc("/healthz", srv.handleHealthz)
+
+	httpSrv := &http.Server{
+		Addr:              cfg.ListenAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	if cfg.TLS.Enabled {
+		tlsCfg, err := buildTLSConfig(cfg.TLS)
+		if err != nil {
+			log.Fatalf("[oracle] tls: %v", err)
+		}
+		httpSrv.TLSConfig = tlsCfg
+		go func() {
+			log.Printf("[oracle] HTTPS listening on %s (mTLS required)", cfg.ListenAddr)
+			if err := httpSrv.ListenAndServeTLS("", ""); err != nil &&
+				!errors.Is(err, http.ErrServerClosed) {
+				log.Fatalf("[oracle] listen tls: %v", err)
+			}
+		}()
+	} else {
+		go func() {
+			log.Printf("[oracle] HTTP listening on %s (no TLS)", cfg.ListenAddr)
+			if err := httpSrv.ListenAndServe(); err != nil &&
+				!errors.Is(err, http.ErrServerClosed) {
+				log.Fatalf("[oracle] listen: %v", err)
+			}
+		}()
+	}
+
+	<-stop
+	log.Println("[oracle] shutdown signal received, stopping...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := httpSrv.Shutdown(ctx); err != nil {
+		log.Printf("[oracle] shutdown error: %v", err)
+	}
+	log.Printf("[oracle] stopped. total=%d ok=%d rejected=%d",
+		srv.requestsTotal.Load(), srv.requestsOK.Load(), srv.requestsRej.Load())
+}
+
+
+// ============================================
+// FILE: main_test.go
+// ============================================
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"nis-core/internal/crypto"
+	"nis-core/internal/oracle"
+)
+
+func newTestServer(t *testing.T) *Server {
+	t.Helper()
+	g := crypto.NewGOSTProvider()
+	priv, pub, err := g.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("keypair: %v", err)
+	}
+	return &Server{g: g, priv: priv, pub: pub}
+}
+
+func postRegister(t *testing.T, srv *Server, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/register", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.handleRegister(w, req)
+	return w
+}
+
+func TestHandleRegister_Success(t *testing.T) {
+	srv := newTestServer(t)
+
+	body, _ := json.Marshal(oracle.RegisterRequest{
+		DealID:  "DEAL-001",
+		Kadastr: "77:01:0001001:102",
+	})
+	w := postRegister(t, srv, body)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body: %s", w.Code, w.Body.String())
+	}
+
+	var resp oracle.RegisterResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp.Success {
+		t.Fatal("expected success=true")
+	}
+	if resp.DealID != "DEAL-001" {
+		t.Fatalf("dealID = %q", resp.DealID)
+	}
+
+	// РџСЂРѕРІРµСЂСЏРµРј РїРѕРґРїРёСЃСЊ С‡РµСЂРµР· РЅРµР·Р°РІРёСЃРёРјС‹Р№ РІРµСЂРёС„РёРєР°С‚РѕСЂ.
+	v, err := oracle.NewVerifier(srv.g, srv.pub)
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	if err := v.VerifyResponse(&resp, "DEAL-001", "77:01:0001001:102"); err != nil {
+		t.Fatalf("VerifyResponse: %v", err)
+	}
+
+	if srv.requestsOK.Load() != 1 {
+		t.Fatalf("requestsOK = %d", srv.requestsOK.Load())
+	}
+}
+
+func TestHandleRegister_Reject(t *testing.T) {
+	srv := newTestServer(t)
+	srv.alwaysRej = true
+
+	body, _ := json.Marshal(oracle.RegisterRequest{
+		DealID:  "DEAL-002",
+		Kadastr: "77:01:0001001:103",
+	})
+	w := postRegister(t, srv, body)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+
+	var resp oracle.RegisterResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Success {
+		t.Fatal("expected success=false")
+	}
+
+	// Р”Р°Р¶Рµ РїСЂРё РѕС‚РєР°Р·Рµ РїРѕРґРїРёСЃСЊ РІР°Р»РёРґРЅР° вЂ” РѕСЂР°РєСѓР» РїРѕРґРїРёСЃС‹РІР°РµС‚ СЃРІРѕР№ РІРµСЂРґРёРєС‚.
+	v, _ := oracle.NewVerifier(srv.g, srv.pub)
+	if err := v.VerifyResponse(&resp, "DEAL-002", "77:01:0001001:103"); err != nil {
+		t.Fatalf("VerifyResponse: %v", err)
+	}
+
+	if srv.requestsRej.Load() != 1 {
+		t.Fatalf("requestsRej = %d", srv.requestsRej.Load())
+	}
+}
+
+func TestHandleRegister_MissingFields(t *testing.T) {
+	srv := newTestServer(t)
+	body, _ := json.Marshal(oracle.RegisterRequest{DealID: "only-deal"})
+	w := postRegister(t, srv, body)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestHandleRegister_BadJSON(t *testing.T) {
+	srv := newTestServer(t)
+	w := postRegister(t, srv, []byte("{not json}"))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestHandleRegister_MethodNotAllowed(t *testing.T) {
+	srv := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/register", nil)
+	w := httptest.NewRecorder()
+	srv.handleRegister(w, req)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", w.Code)
+	}
+}
+
+func TestHandleHealthz(t *testing.T) {
+	srv := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	srv.handleHealthz(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+}
+
+
+// ============================================
+// FILE: app.go
+// ============================================
+// Package app СЃРѕР±РёСЂР°РµС‚ РєРѕРјРїРѕРЅРµРЅС‚С‹ В«Р¦РёС„СЂРѕРІРѕР№ РќРРЎВ» РІ РµРґРёРЅС‹Р№ СѓР·РµР»:
+// С…СЂР°РЅРёР»РёС‰Рµ, РєСЂРёРїС‚РѕРїСЂРѕРІР°Р№РґРµСЂ, РґРІРёР¶РѕРє СЌСЃРєСЂРѕСѓ, РєР»РёРµРЅС‚ Рё РІРµСЂРёС„РёРєР°С‚РѕСЂ
+// РѕСЂР°РєСѓР»Р° Р РѕСЃСЂРµРµСЃС‚СЂР°.
+//
+// Р’ РїСЂРѕРґР°РєС€РµРЅРµ СЂРѕР»Рё СЂР°Р·РґРµР»РµРЅС‹ РјРµР¶РґСѓ СѓР·Р»Р°РјРё:
+//   - СѓР·РµР» СЌРјРёС‚РµРЅС‚Р° (Р РѕСЃРІРѕРµРЅРёРїРѕС‚РµРєР°) Р·РЅР°РµС‚ С‚РѕР»СЊРєРѕ СЃРІРѕР№ РїСЂРёРІР°С‚РЅС‹Р№ РєР»СЋС‡;
+//   - СѓР·РµР» РѕСЂР°РєСѓР»Р° (Р РѕСЃСЂРµРµСЃС‚СЂ) Р·РЅР°РµС‚ С‚РѕР»СЊРєРѕ СЃРІРѕР№ РїСЂРёРІР°С‚РЅС‹Р№ РєР»СЋС‡;
+//   - СѓР·РµР» РїСЂРѕРІРµСЂРєРё (РњРёРЅРѕР±РѕСЂРѕРЅС‹) Р·РЅР°РµС‚ РїСѓР±Р»РёС‡РЅС‹Рµ РєР»СЋС‡Рё РѕР±РµРёС… СЃС‚РѕСЂРѕРЅ.
+//
+// Р’ РґРµРјРѕРЅСЃС‚СЂР°С†РёРѕРЅРЅРѕРј РїСЂРѕС‚РѕС‚РёРїРµ РѕРґРёРЅ РїСЂРѕС†РµСЃСЃ РјРѕР¶РµС‚ РґРµСЂР¶Р°С‚СЊ РїСЂРёРІР°С‚РЅС‹Рµ
+// РєР»СЋС‡Рё РѕР±РµРёС… СЃС‚РѕСЂРѕРЅ, С‡С‚РѕР±С‹ РїСЂРѕРіРЅР°С‚СЊ СЃРєРІРѕР·РЅРѕР№ СЃС†РµРЅР°СЂРёР№ Р±РµР· СЃРµС‚Рё.
+// Р­С‚Рѕ СЏРІРЅРѕ РїРѕРјРµС‡РµРЅРѕ С„Р»Р°РіРѕРј DemoMode.
+package app
+
+import (
+	"bytes"
+	"encoding/hex"
+	"fmt"
+	"os"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/bi-zone/ruwireguard-go/crypto/gost/gost3410"
+
+	"nis-core/internal/crypto"
+	"nis-core/internal/engine"
+	"nis-core/internal/ledger"
+	"nis-core/internal/oracle"
+)
+
+// Config вЂ” РєРѕРЅС„РёРіСѓСЂР°С†РёСЏ СѓР·Р»Р°.
+type Config struct {
+	// NodeID вЂ” РёРґРµРЅС‚РёС„РёРєР°С‚РѕСЂ СѓР·Р»Р° РІ Zero Trust РєРѕРЅС‚СѓСЂРµ.
+	NodeID string `yaml:"node_id"`
+
+	// DBPath вЂ” РїСѓС‚СЊ Рє РґРёСЂРµРєС‚РѕСЂРёРё BadgerDB.
+	DBPath string `yaml:"db_path"`
+
+	// APIAddr вЂ” Р°РґСЂРµСЃ HTTP API СѓР·Р»Р° (РЅР°РїСЂРёРјРµСЂ, ":8080").
+	APIAddr string `yaml:"api_addr"`
+
+	// OracleURL вЂ” Р±Р°Р·РѕРІС‹Р№ URL СЃРµСЂРІРёСЃР°-РѕСЂР°РєСѓР»Р° Р РѕСЃСЂРµРµСЃС‚СЂР°.
+	// РџСѓСЃС‚Р°СЏ СЃС‚СЂРѕРєР° вЂ” СѓР·РµР» СЂР°Р±РѕС‚Р°РµС‚ offline, Р±РµР· РѕР±СЂР°С‰РµРЅРёСЏ Рє РѕСЂР°РєСѓР»Сѓ.
+	OracleURL string `yaml:"oracle_url"`
+
+	// OracleTLS вЂ” РЅР°СЃС‚СЂРѕР№РєРё mTLS РґР»СЏ СЃРѕРµРґРёРЅРµРЅРёСЏ СЃ РѕСЂР°РєСѓР»РѕРј.
+	// Р•СЃР»Рё Enabled=false, РёСЃРїРѕР»СЊР·СѓРµС‚СЃСЏ РѕР±С‹С‡РЅС‹Р№ HTTP.
+	OracleTLS OracleTLSConf `yaml:"oracle_tls"`
+
+	// Keys вЂ” РєР»СЋС‡РµРІРѕР№ РјР°С‚РµСЂРёР°Р».
+	Keys KeysConfig `yaml:"keys"`
+
+	// DemoMode СЂР°Р·СЂРµС€Р°РµС‚ РґРµСЂР¶Р°С‚СЊ РїСЂРёРІР°С‚РЅС‹Рµ РєР»СЋС‡Рё РѕР±РµРёС… СЃС‚РѕСЂРѕРЅ
+	// (СЌРјРёС‚РµРЅС‚Р° Рё РѕСЂР°РєСѓР»Р°) РІ РѕРґРЅРѕРј РїСЂРѕС†РµСЃСЃРµ. РўРѕР»СЊРєРѕ РґР»СЏ РїСЂРѕС‚РѕС‚РёРїР°.
+	DemoMode bool `yaml:"demo_mode"`
+}
+
+// KeysConfig вЂ” РєР»СЋС‡РµРІРѕР№ РјР°С‚РµСЂРёР°Р» РІ hex-С„РѕСЂРјРµ.
+//
+// РљР°Р¶РґР°СЏ СЂРѕР»СЊ (issuer, oracle) РјРѕР¶РµС‚ Р±С‹С‚СЊ РѕРїРёСЃР°РЅР° РѕРґРЅРёРј РёР· С‚СЂС‘С…
+// СЃРїРѕСЃРѕР±РѕРІ, РІ РїРѕСЂСЏРґРєРµ РїСЂРёРѕСЂРёС‚РµС‚Р°:
+//  1. РџСЂРёРІР°С‚РЅС‹Р№ РєР»СЋС‡ (priv) вЂ” РёР· РЅРµРіРѕ РІС‹РІРѕРґРёС‚СЃСЏ РїСѓР±Р»РёС‡РЅС‹Р№;
+//  2. РџСѓР±Р»РёС‡РЅС‹Р№ РєР»СЋС‡ (pub) вЂ” С‚РѕР»СЊРєРѕ РґР»СЏ РІРµСЂРёС„РёРєР°С†РёРё;
+//  3. GenerateIfMissing=true вЂ” СЃРіРµРЅРµСЂРёСЂРѕРІР°С‚СЊ РїР°СЂСѓ (С‚РѕР»СЊРєРѕ РІ demo).
+type KeysConfig struct {
+	// РџСЂРёРІР°С‚РЅС‹Рµ РєР»СЋС‡Рё вЂ” С‚РѕР»СЊРєРѕ РґР»СЏ demo-СЂРµР¶РёРјР°.
+	IssuerPrivateHex string `yaml:"issuer_private_hex"`
+	OraclePrivateHex string `yaml:"oracle_private_hex"`
+
+	// РџСѓР±Р»РёС‡РЅС‹Рµ РєР»СЋС‡Рё вЂ” РґР»СЏ production-СЂРµР¶РёРјР°, РєРѕРіРґР° СѓР·РµР»
+	// С‚РѕР»СЊРєРѕ РІРµСЂРёС„РёС†РёСЂСѓРµС‚ РїРѕРґРїРёСЃРё СѓРґР°Р»С‘РЅРЅС‹С… СЃС‚РѕСЂРѕРЅ.
+	IssuerPublicHex string `yaml:"issuer_public_hex"`
+	OraclePublicHex string `yaml:"oracle_public_hex"`
+
+	// РЎРіРµРЅРµСЂРёСЂРѕРІР°С‚СЊ РѕС‚СЃСѓС‚СЃС‚РІСѓСЋС‰РёРµ РєР»СЋС‡Рё. РўРѕР»СЊРєРѕ РІ DemoMode.
+	GenerateIfMissing bool `yaml:"generate_if_missing"`
+}
+
+// OracleTLSConf вЂ” РЅР°СЃС‚СЂРѕР№РєРё mTLS-СЃРѕРµРґРёРЅРµРЅРёСЏ СѓР·Р»Р° СЃ РѕСЂР°РєСѓР»РѕРј.
+type OracleTLSConf struct {
+	Enabled        bool   `yaml:"enabled"`
+	CACertPath     string `yaml:"ca_cert_path"`
+	ClientCertPath string `yaml:"client_cert_path"`
+	ClientKeyPath  string `yaml:"client_key_path"`
+}
+
+// LoadConfig С‡РёС‚Р°РµС‚ РєРѕРЅС„РёРі РёР· YAML-С„Р°Р№Р»Р°.
+func LoadConfig(path string) (*Config, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("app: read config %q: %w", path, err)
+	}
+	var cfg Config
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	// KnownFields(true) Р·Р°СЃС‚Р°РІР»СЏРµС‚ yaml-РґРµРєРѕРґРµСЂ РІРµСЂРЅСѓС‚СЊ РѕС€РёР±РєСѓ РїСЂРё
+	// РІСЃС‚СЂРµС‡Рµ РЅРµРёР·РІРµСЃС‚РЅРѕРіРѕ РєР»СЋС‡Р°. Р­С‚Рѕ Р»РѕРІРёС‚ РѕРїРµС‡Р°С‚РєРё РІСЂРѕРґРµ `db_pth`.
+	dec.KnownFields(true)
+	if err := dec.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("app: parse config %q: %w", path, err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+// Validate РїСЂРѕРІРµСЂСЏРµС‚ РѕР±СЏР·Р°С‚РµР»СЊРЅС‹Рµ РїРѕР»СЏ Рё РїРѕРґСЃС‚Р°РІР»СЏРµС‚ РґРµС„РѕР»С‚С‹.
+func (c *Config) Validate() error {
+	if c == nil {
+		return fmt.Errorf("app: nil config")
+	}
+	if c.NodeID == "" {
+		return fmt.Errorf("app: node_id is required")
+	}
+	if c.DBPath == "" {
+		return fmt.Errorf("app: db_path is required")
+	}
+	if c.APIAddr == "" {
+		c.APIAddr = ":8080"
+	}
+	if !c.DemoMode && c.Keys.GenerateIfMissing {
+		return fmt.Errorf("app: keys.generate_if_missing allowed only in DemoMode")
+	}
+	// Р”Р»СЏ РєР°Р¶РґРѕР№ СЂРѕР»Рё РґРѕР»Р¶РµРЅ Р±С‹С‚СЊ С…РѕС‚СЏ Р±С‹ РѕРґРёРЅ РёСЃС‚РѕС‡РЅРёРє РєР»СЋС‡Р°.
+	if c.Keys.IssuerPrivateHex == "" &&
+		c.Keys.IssuerPublicHex == "" &&
+		!c.Keys.GenerateIfMissing {
+		return fmt.Errorf(
+			"app: provide issuer_private_hex, issuer_public_hex or generate_if_missing")
+	}
+	if c.Keys.OraclePrivateHex == "" &&
+		c.Keys.OraclePublicHex == "" &&
+		!c.Keys.GenerateIfMissing {
+		return fmt.Errorf(
+			"app: provide oracle_private_hex, oracle_public_hex or generate_if_missing")
+	}
+	return nil
+}
+
+// App вЂ” СЃРѕР±СЂР°РЅРЅС‹Р№ СѓР·РµР».
+type App struct {
+	Config *Config
+
+	Crypto *crypto.GOSTProvider
+	Ledger *ledger.BadgerLedger
+	Engine *engine.SmartContractEngine
+	Oracle *oracle.Client // nil, РµСЃР»Рё OracleURL РЅРµ Р·Р°РґР°РЅ
+
+	// РџСѓР±Р»РёС‡РЅС‹Рµ РєР»СЋС‡Рё РґРѕРІРµСЂРµРЅРЅС‹С… СЃС‚РѕСЂРѕРЅ вЂ” РІСЃРµРіРґР° Р·Р°РїРѕР»РЅРµРЅС‹.
+	IssuerPub *gost3410.PublicKey
+	OraclePub *gost3410.PublicKey
+
+	// РџСЂРёРІР°С‚РЅС‹Рµ РєР»СЋС‡Рё вЂ” Р·Р°РїРѕР»РЅРµРЅС‹, РµСЃР»Рё Р·Р°РґР°РЅС‹ РІ РєРѕРЅС„РёРіРµ
+	// РёР»Рё СЃРіРµРЅРµСЂРёСЂРѕРІР°РЅС‹ РІ demo-СЂРµР¶РёРјРµ. РРЅР°С‡Рµ nil.
+	IssuerPriv *gost3410.PrivateKey
+	OraclePriv *gost3410.PrivateKey
+}
+
+// New СЃРѕР±РёСЂР°РµС‚ СѓР·РµР» РёР· РєРѕРЅС„РёРіСѓСЂР°С†РёРё.
+func New(cfg *Config) (*App, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("app: nil config")
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
+	g := crypto.NewGOSTProvider()
+	generate := cfg.Keys.GenerateIfMissing && cfg.DemoMode
+
+	issuerPriv, issuerPub, err := resolveKeypair(
+		g,
+		cfg.Keys.IssuerPrivateHex,
+		cfg.Keys.IssuerPublicHex,
+		generate,
+		"issuer",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("app: issuer keys: %w", err)
+	}
+
+	oraclePriv, oraclePub, err := resolveKeypair(
+		g,
+		cfg.Keys.OraclePrivateHex,
+		cfg.Keys.OraclePublicHex,
+		generate,
+		"oracle",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("app: oracle keys: %w", err)
+	}
+
+	bl, err := ledger.NewBadgerLedger(cfg.DBPath)
+	if err != nil {
+		return nil, fmt.Errorf("app: open ledger: %w", err)
+	}
+
+	eng, err := engine.NewSmartContractEngine(bl, g, issuerPub, oraclePub)
+	if err != nil {
+		_ = bl.Close()
+		return nil, fmt.Errorf("app: new engine: %w", err)
+	}
+
+	a := &App{
+		Config:     cfg,
+		Crypto:     g,
+		Ledger:     bl,
+		Engine:     eng,
+		IssuerPub:  issuerPub,
+		OraclePub:  oraclePub,
+		IssuerPriv: issuerPriv,
+		OraclePriv: oraclePriv,
+	}
+
+	if cfg.OracleURL != "" {
+		var oc *oracle.Client
+		var err error
+		if cfg.OracleTLS.Enabled {
+			if cfg.OracleTLS.CACertPath == "" ||
+				cfg.OracleTLS.ClientCertPath == "" ||
+				cfg.OracleTLS.ClientKeyPath == "" {
+				_ = a.Close()
+				return nil, fmt.Errorf(
+					"app: oracle_tls.enabled requires ca_cert_path, client_cert_path and client_key_path")
+			}
+			oc, err = oracle.NewMTLSClient(
+				cfg.OracleURL,
+				cfg.OracleTLS.CACertPath,
+				cfg.OracleTLS.ClientCertPath,
+				cfg.OracleTLS.ClientKeyPath,
+			)
+		} else {
+			oc, err = oracle.NewClient(cfg.OracleURL, nil)
+		}
+		if err != nil {
+			_ = a.Close()
+			return nil, fmt.Errorf("app: oracle client: %w", err)
+		}
+		a.Oracle = oc
+	}
+
+	return a, nil
+}
+
+// Close РѕСЃРІРѕР±РѕР¶РґР°РµС‚ СЂРµСЃСѓСЂСЃС‹.
+func (a *App) Close() error {
+	if a == nil || a.Ledger == nil {
+		return nil
+	}
+	return a.Ledger.Close()
+}
+
+// resolveKeypair РІРѕСЃСЃС‚Р°РЅР°РІР»РёРІР°РµС‚ РєР»СЋС‡Рё РёР· hex РёР»Рё РіРµРЅРµСЂРёСЂСѓРµС‚ РЅРѕРІС‹Рµ.
+//
+// РџСЂРёРѕСЂРёС‚РµС‚ РёСЃС‚РѕС‡РЅРёРєРѕРІ:
+//  1. РџСЂРёРІР°С‚РЅС‹Р№ РєР»СЋС‡ (privHex) вЂ” РёР· РЅРµРіРѕ РІС‹РІРѕРґРёС‚СЃСЏ РїСѓР±Р»РёС‡РЅС‹Р№.
+//  2. РџСѓР±Р»РёС‡РЅС‹Р№ РєР»СЋС‡ (pubHex) вЂ” С‚РѕР»СЊРєРѕ РґР»СЏ РІРµСЂРёС„РёРєР°С†РёРё.
+//  3. generate=true вЂ” СЃРіРµРЅРµСЂРёСЂРѕРІР°С‚СЊ РЅРѕРІСѓСЋ РїР°СЂСѓ.
+//
+// РџСЂРёРІР°С‚РЅС‹Р№ РєР»СЋС‡ РјРѕР¶РµС‚ Р±С‹С‚СЊ nil (read-only СѓР·РµР»).
+func resolveKeypair(
+	g *crypto.GOSTProvider,
+	privHex, pubHex string,
+	generate bool,
+	role string,
+) (*gost3410.PrivateKey, *gost3410.PublicKey, error) {
+	if privHex != "" {
+		raw, err := hex.DecodeString(privHex)
+		if err != nil {
+			return nil, nil, fmt.Errorf("decode %s private hex: %w", role, err)
+		}
+		priv, err := g.NewPrivateKeyFromRaw(raw)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse %s private: %w", role, err)
+		}
+		pub, err := priv.PublicKey()
+		if err != nil {
+			return nil, nil, fmt.Errorf("derive %s public: %w", role, err)
+		}
+		return priv, pub, nil
+	}
+
+	if pubHex != "" {
+		raw, err := hex.DecodeString(pubHex)
+		if err != nil {
+			return nil, nil, fmt.Errorf("decode %s public hex: %w", role, err)
+		}
+		pub, err := g.NewPublicKeyFromRaw(raw)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse %s public: %w", role, err)
+		}
+		return nil, pub, nil
+	}
+
+	if generate {
+		priv, pub, err := g.GenerateKeyPair()
+		if err != nil {
+			return nil, nil, err
+		}
+		fmt.Fprintf(os.Stderr, "[app] generated %s private: %s\n",
+			role, hex.EncodeToString(priv.Raw()))
+		fmt.Fprintf(os.Stderr, "[app] generated %s public : %s\n",
+			role, hex.EncodeToString(pub.Raw()))
+		return priv, pub, nil
+	}
+
+	return nil, nil, fmt.Errorf("no key material for %s", role)
+}
+
+
+// ============================================
+// FILE: app_test.go
+// ============================================
+package app
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"nis-core/internal/engine"
+)
+
+func writeConfig(t *testing.T, content string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}
+
+func TestLoadConfig_HappyPath(t *testing.T) {
+	path := writeConfig(t, `
+node_id: test-node
+db_path: /tmp/nis-test
+oracle_url: http://localhost:8081
+demo_mode: true
+keys:
+  generate_if_missing: true
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.NodeID != "test-node" {
+		t.Fatalf("node_id = %q", cfg.NodeID)
+	}
+	if !cfg.DemoMode {
+		t.Fatal("demo_mode should be true")
+	}
+	if cfg.OracleURL != "http://localhost:8081" {
+		t.Fatalf("oracle_url = %q", cfg.OracleURL)
+	}
+}
+
+func TestLoadConfig_MissingFile(t *testing.T) {
+	if _, err := LoadConfig("/nonexistent/config.yaml"); err == nil {
+		t.Fatal("expected error for missing file")
+	}
+}
+
+func TestLoadConfig_UnknownField(t *testing.T) {
+	path := writeConfig(t, `
+node_id: x
+db_path: /tmp
+unknown_field: true
+`)
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("expected error for unknown field")
+	}
+	if !strings.Contains(err.Error(), "unknown_field") {
+		t.Fatalf("error should mention unknown_field, got: %v", err)
+	}
+}
+
+func TestConfig_Validate(t *testing.T) {
+	cases := []struct {
+		name   string
+		cfg    Config
+		expect string
+	}{
+		{
+			name:   "empty node_id",
+			cfg:    Config{DBPath: "/tmp", DemoMode: true},
+			expect: "node_id",
+		},
+		{
+			name:   "empty db_path",
+			cfg:    Config{NodeID: "x", DemoMode: true},
+			expect: "db_path",
+		},
+		{
+			name:   "issuer key required outside demo",
+			cfg:    Config{NodeID: "x", DBPath: "/tmp"},
+			expect: "issuer_private_hex",
+		},
+		{
+			name: "generate_if_missing forbidden outside demo",
+			cfg: Config{
+				NodeID: "x", DBPath: "/tmp",
+				Keys: KeysConfig{IssuerPrivateHex: "aa", GenerateIfMissing: true},
+			},
+			expect: "generate_if_missing",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := c.cfg.Validate()
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if !strings.Contains(err.Error(), c.expect) {
+				t.Fatalf("error should mention %q, got: %v", c.expect, err)
+			}
+		})
+	}
+}
+
+func TestApp_New_GeneratesKeys(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &Config{
+		NodeID:   "test",
+		DBPath:   dir,
+		DemoMode: true,
+		Keys:     KeysConfig{GenerateIfMissing: true},
+	}
+
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer a.Close()
+
+	if a.IssuerPriv == nil || a.IssuerPub == nil {
+		t.Fatal("issuer keys not set")
+	}
+	if a.OraclePriv == nil || a.OraclePub == nil {
+		t.Fatal("oracle keys not set")
+	}
+	if a.Engine == nil || a.Ledger == nil || a.Crypto == nil {
+		t.Fatal("core components missing")
+	}
+}
+
+func TestApp_New_RejectsNilConfig(t *testing.T) {
+	if _, err := New(nil); err == nil {
+		t.Fatal("expected error for nil config")
+	}
+}
+
+func TestApp_EndToEnd_DemoScenario(t *testing.T) {
+	// РџРѕР»РЅС‹Р№ СЃС†РµРЅР°СЂРёР№: СЌРјРёСЃСЃРёСЏ в†’ Р±Р»РѕРєРёСЂРѕРІРєР° в†’ РѕС‚РІРµС‚ РѕСЂР°РєСѓР»Р° в†’ released.
+	dir := t.TempDir()
+	cfg := &Config{
+		NodeID:   "test",
+		DBPath:   dir,
+		DemoMode: true,
+		Keys:     KeysConfig{GenerateIfMissing: true},
+	}
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer a.Close()
+
+	const (
+		dealID   = "DEAL-E2E-001"
+		inn      = "7701982341"
+		kadastr  = "77:01:0001001:102"
+		milHash  = "mil-hash-e2e"
+		amount   = uint64(485_000_000)
+	)
+
+	token, err := a.Engine.IssueColoredRubles(
+		amount, milHash, inn, kadastr, a.IssuerPriv,
+	)
+	if err != nil {
+		t.Fatalf("IssueColoredRubles: %v", err)
+	}
+
+	if err := a.Engine.LockInEscrow(dealID, token, engine.DefaultLockDuration); err != nil {
+		t.Fatalf("LockInEscrow: %v", err)
+	}
+
+	// Р¤РѕСЂРјРёСЂСѓРµРј РїРѕРґРїРёСЃСЊ РѕСЂР°РєСѓР»Р° Р»РѕРєР°Р»СЊРЅРѕ (РІ СЂРµР°Р»СЊРЅРѕСЃС‚Рё вЂ” РїСЂРёС€Р»Р° Р±С‹ РїРѕ HTTP).
+	digest := a.Crypto.Streebog256(
+		[]byte(dealID + ":" + kadastr + ":true"),
+	)
+	sig, err := a.Crypto.SignGOST3410(a.OraclePriv, digest)
+	if err != nil {
+		t.Fatalf("sign oracle: %v", err)
+	}
+
+	if err := a.Engine.ProcessRosreestrCallback(dealID, kadastr, true, sig); err != nil {
+		t.Fatalf("ProcessRosreestrCallback: %v", err)
+	}
+
+	c, err := a.Engine.GetEscrow(dealID)
+	if err != nil {
+		t.Fatalf("GetEscrow: %v", err)
+	}
+	if c.Status != engine.StatusReleased {
+		t.Fatalf("status = %s, want %s", c.Status, engine.StatusReleased)
+	}
+}
+
+
+// ============================================
+// FILE: audit.go
+// ============================================
+// Package audit С„РѕСЂРјРёСЂСѓРµС‚ Merkle-РґРµСЂРµРІРѕ РґР»СЏ РЅРµР·Р°РІРёСЃРёРјРѕР№ РїСЂРѕРІРµСЂРєРё
+// С†РµР»РѕСЃС‚РЅРѕСЃС‚Рё СЂРµРµСЃС‚СЂР° СЌСЃРєСЂРѕСѓ-РєРѕРЅС‚СЂР°РєС‚РѕРІ.
+//
+// Р•РґРёРЅР°СЏ С‚РѕС‡РєР° С„РѕСЂРјРёСЂРѕРІР°РЅРёСЏ: РёСЃРїРѕР»СЊР·СѓРµС‚СЃСЏ Рё CLI-Р°СѓРґРёС‚РѕСЂРѕРј (cmd/auditor-cli),
+// Рё HTTP-СѓР·Р»РѕРј (cmd/nis-node) РґР»СЏ endpoint /api/v1/security/status.
+// Р­С‚Рѕ РіР°СЂР°РЅС‚РёСЂСѓРµС‚, С‡С‚Рѕ РєРѕСЂРЅРµРІРѕР№ С…СЌС€, РїРѕСЃС‡РёС‚Р°РЅРЅС‹Р№ РЅРµР·Р°РІРёСЃРёРјРѕ РґРІСѓРјСЏ
+// РїСЂРѕС†РµСЃСЃР°РјРё, СЃРѕРІРїР°РґР°РµС‚.
+package audit
+
+import (
+	"encoding/json"
+	"sort"
+
+	"nis-core/internal/crypto"
+	"nis-core/internal/engine"
+)
+
+// LeafData С„РѕСЂРјРёСЂСѓРµС‚ СЃРѕРґРµСЂР¶РёРјРѕРµ Р»РёСЃС‚Р° Merkle-РґРµСЂРµРІР° РґР»СЏ РєРѕРЅС‚СЂР°РєС‚Р°.
+//
+// Р’ Р»РёСЃС‚ РІС…РѕРґСЏС‚ С‚РѕР»СЊРєРѕ РїРѕР»СЏ, РЅРµ СЃРѕРґРµСЂР¶Р°С‰РёРµ РїРµСЂСЃРѕРЅР°Р»СЊРЅС‹С… РґР°РЅРЅС‹С…:
+// dealID, tokenID, СЃСѓРјРјР°, color tag, СЃС‚Р°С‚СѓСЃ Рё РІСЂРµРјРµРЅРЅС‹Рµ РјРµС‚РєРё.
+// РџРѕР»Рµ military_id_hash Рё РїРѕРґРїРёСЃРё РќР• РІРєР»СЋС‡Р°СЋС‚СЃСЏ РЅР°РјРµСЂРµРЅРЅРѕ вЂ”
+// С‡С‚РѕР±С‹ Р°СѓРґРёС‚РѕСЂ РјРѕРі РїСЂРѕРІРµСЂРёС‚СЊ С†РµР»РѕСЃС‚РЅРѕСЃС‚СЊ, РЅРѕ РЅРµ РёРјРµР» РґРѕСЃС‚СѓРїР°
+// Рє РїРµСЂСЃРѕРЅР°Р»СЊРЅС‹Рј РґР°РЅРЅС‹Рј РІРѕРµРЅРЅРѕСЃР»СѓР¶Р°С‰РµРіРѕ.
+//
+// Р¤РѕСЂРјР°С‚ вЂ” JSON СЃ СЃРѕСЂС‚РёСЂРѕРІР°РЅРЅС‹РјРё РєР»СЋС‡Р°РјРё (Go 1.12+). Р­С‚Рѕ РґР°С‘С‚
+// РґРµС‚РµСЂРјРёРЅРёСЂРѕРІР°РЅРЅС‹Р№ Р±Р°Р№С‚РѕРІС‹Р№ РїРѕС‚РѕРє РїСЂРё РѕРґРёРЅР°РєРѕРІС‹С… РґР°РЅРЅС‹С….
+func LeafData(dealID string, c *engine.EscrowContract) []byte {
+	rec := map[string]any{
+		"deal_id":    dealID,
+		"token_id":   c.Token.TokenID,
+		"amount":     c.Token.Amount,
+		"color_tag":  c.Token.TargetColorTag,
+		"status":     string(c.Status),
+		"created_at": c.CreatedAt,
+		"updated_at": c.UpdatedAt,
+		"timeout_at": c.TimeoutAt,
+	}
+	buf, _ := json.Marshal(rec)
+	return buf
+}
+
+// Tree вЂ” РѕР±С‘СЂС‚РєР° РЅР°Рґ Merkle-РґРµСЂРµРІРѕРј СЃ СЃРѕС…СЂР°РЅРµРЅРёРµРј РїРѕСЂСЏРґРєР° DealID.
+// РќСѓР¶РЅР°, С‡С‚РѕР±С‹ РїРѕ DealID РЅР°Р№С‚Рё РёРЅРґРµРєСЃ Р»РёСЃС‚Р° РґР»СЏ РґРѕРєР°Р·Р°С‚РµР»СЊСЃС‚РІР° РІРєР»СЋС‡РµРЅРёСЏ.
+type Tree struct {
+	Tree    *crypto.MerkleTree
+	DealIDs []string // РІ РїРѕСЂСЏРґРєРµ Р»РёСЃС‚СЊРµРІ
+}
+
+// BuildTree СЃС‚СЂРѕРёС‚ Merkle-РґРµСЂРµРІРѕ РїРѕ РєР°СЂС‚Рµ РєРѕРЅС‚СЂР°РєС‚РѕРІ.
+//
+// РљР»СЋС‡Рё СЃРѕСЂС‚РёСЂСѓСЋС‚СЃСЏ вЂ” РґРµС‚РµСЂРјРёРЅРёСЂРѕРІР°РЅРЅС‹Р№ РїРѕСЂСЏРґРѕРє Р»РёСЃС‚СЊРµРІ РєСЂРёС‚РёС‡РµРЅ,
+// РёРЅР°С‡Рµ РєРѕСЂРЅРµРІРѕР№ С…СЌС€ Р±СѓРґРµС‚ СЂР°Р·РЅС‹Рј РїСЂРё РѕРґРёРЅР°РєРѕРІС‹С… РґР°РЅРЅС‹С….
+func BuildTree(
+	g *crypto.GOSTProvider,
+	contracts map[string]*engine.EscrowContract,
+) (*Tree, error) {
+	keys := make([]string, 0, len(contracts))
+	for k := range contracts {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	leaves := make([][]byte, len(keys))
+	for i, k := range keys {
+		leaves[i] = LeafData(k, contracts[k])
+	}
+
+	t, err := crypto.BuildMerkleTree(g, leaves)
+	if err != nil {
+		return nil, err
+	}
+	return &Tree{Tree: t, DealIDs: keys}, nil
+}
+
+// IndexOf РІРѕР·РІСЂР°С‰Р°РµС‚ РёРЅРґРµРєСЃ Р»РёСЃС‚Р° РґР»СЏ DealID РёР»Рё -1.
+func (t *Tree) IndexOf(dealID string) int {
+	for i, k := range t.DealIDs {
+		if k == dealID {
+			return i
+		}
+	}
+	return -1
+}
+
+
+// ============================================
+// FILE: gost.go
+// ============================================
+// Package crypto РїСЂРµРґРѕСЃС‚Р°РІР»СЏРµС‚ РѕР±С‘СЂС‚РєСѓ РЅР°Рґ Р“РћРЎРў-РєСЂРёРїС‚РѕРіСЂР°С„РёРµР№:
+//   - Р“РћРЎРў Р  34.11-2012 (РЎС‚СЂРёР±РѕРі-256 / РЎС‚СЂРёР±РѕРі-512)
+//   - Р“РћРЎРў Р  34.10-2012 (Р­Р¦Рџ РЅР° СЌР»Р»РёРїС‚РёС‡РµСЃРєРёС… РєСЂРёРІС‹С…, 256-Р±РёС‚)
+//   - Р“РћРЎРў Р  34.12-2015 (РљСѓР·РЅРµС‡РёРє) РІ СЂРµР¶РёРјРµ MGM (AEAD)
+//
+// РџСЂРѕС‚РѕС‚РёРї РёСЃРїРѕР»СЊР·СѓРµС‚ РѕС‚РєСЂС‹С‚СѓСЋ Р±РёР±Р»РёРѕС‚РµРєСѓ bi-zone/ruwireguard-go
+// (С‡РёСЃС‚С‹Р№ Go, Р±РµР· CGO). Р’ РїСЂРѕРјС‹С€Р»РµРЅРЅРѕР№ СЌРєСЃРїР»СѓР°С‚Р°С†РёРё С‚СЂРµР±СѓРµС‚СЃСЏ Р·Р°РјРµРЅР°
+// РЅР° СЃРµСЂС‚РёС„РёС†РёСЂРѕРІР°РЅРЅРѕРµ РЎРљР—Р (РљСЂРёРїС‚РѕРџСЂРѕ CSP / ViPNet Client) С‡РµСЂРµР· CGO.
+//
+// РР·РІРµСЃС‚РЅС‹Рµ РѕСЃРѕР±РµРЅРЅРѕСЃС‚Рё MGM РёР· bi-zone:
+//   - NonceSize = 16 Р±Р°Р№С‚.
+//   - РЎС‚Р°СЂС€РёР№ Р±РёС‚ РїРµСЂРІРѕРіРѕ Р±Р°Р№С‚Р° nonce РѕР±СЏР·Р°РЅ Р±С‹С‚СЊ СЂР°РІРµРЅ 0
+//     (СЃС‚СЂСѓРєС‚СѓСЂР° ICN РїРѕ RFC 9058).
+//   - Р‘РёР±Р»РёРѕС‚РµРєР° РїР°РЅРёРєСѓРµС‚ РїСЂРё РЅР°СЂСѓС€РµРЅРёРё СѓСЃР»РѕРІРёР№ РІРјРµСЃС‚Рѕ РІРѕР·РІСЂР°С‚Р° РѕС€РёР±РєРё.
+//     РњС‹ РІР°Р»РёРґРёСЂСѓРµРј nonce Р·Р°СЂР°РЅРµРµ Рё Р·Р°С‰РёС‰Р°РµРј РІС‹Р·С‹РІР°СЋС‰РёР№ РєРѕРґ.
+//
+// РџРѕС‚РѕРєРѕР±РµР·РѕРїР°СЃРЅРѕСЃС‚СЊ:
+//   - РџР°РєРµС‚ gost3410 РІ bi-zone РёСЃРїРѕР»СЊР·СѓРµС‚ РѕР±С‰РёРµ *big.Int-Р±СѓС„РµСЂС‹ РІРЅСѓС‚СЂРё
+//     Curve Рё PrivateKey. РџР°СЂР°Р»Р»РµР»СЊРЅС‹Рµ РІС‹Р·РѕРІС‹ SignDigest/VerifyDigest
+//     РЅР° РѕРґРЅРѕР№ Curve РїСЂРёРІРѕРґСЏС‚ Рє РїРѕСЂС‡Рµ РїР°РјСЏС‚Рё Рё РїР°РЅРёРєРµ math/big.
+//   - РњС‹ СЃРµСЂРёР°Р»РёР·СѓРµРј РІСЃРµ РєСЂРёРїС‚РѕРѕРїРµСЂР°С†РёРё С‡РµСЂРµР· sync.Mutex. Р­С‚Рѕ
+//     РґРµР»Р°РµС‚ GOSTProvider РїРѕС‚РѕРєРѕР±РµР·РѕРїР°СЃРЅС‹Рј, С†РµРЅРѕР№ РїРѕС‚РµСЂРё РїР°СЂР°Р»Р»РµР»РёР·РјР°
+//     РЅР° РїРѕРґРїРёСЃСЏС… Рё РІРµСЂРёС„РёРєР°С†РёСЏС….
+//   - РЎС‚СЂРёР±РѕРі (SHA-РїРѕРґРѕР±РЅС‹Р№) Рё MGM (Р±Р»РѕС‡РЅС‹Р№ С€РёС„СЂ) РїРѕС‚РѕРєРѕР±РµР·РѕРїР°СЃРЅС‹
+//     СЃР°РјРё РїРѕ СЃРµР±Рµ Рё РЅРµ РЅСѓР¶РґР°СЋС‚СЃСЏ РІ РјСЊСЋС‚РµРєСЃРµ.
+package crypto
+
+import (
+	"crypto"
+	"crypto/cipher"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"hash"
+	"io"
+	"sync"
+
+	"github.com/bi-zone/ruwireguard-go/crypto/gost/gost3410"
+	"github.com/bi-zone/ruwireguard-go/crypto/gost/gost34112012256"
+	"github.com/bi-zone/ruwireguard-go/crypto/gost/gost34112012512"
+	"github.com/bi-zone/ruwireguard-go/crypto/gost/gost3412128"
+	"github.com/bi-zone/ruwireguard-go/crypto/mgm"
+)
+
+const (
+	KuznechikKeySize       = 32
+	KuznechikBlockSize     = 16
+	StreebogSize           = 32
+	Streebog512Size        = 64
+	MGMTagSize             = 16
+	MGMNonceSize           = 16
+	GOST3410SignatureSize  = 64
+	GOST3410PrivateKeySize = 32
+)
+
+// GOSTProvider РёРЅРєР°РїСЃСѓР»РёСЂСѓРµС‚ РєСЂРёРїС‚РѕРіСЂР°С„РёС‡РµСЃРєРёРµ РѕРїРµСЂР°С†РёРё РїРѕ Р“РћРЎРў.
+//
+// РџРѕС‚РѕРєРѕР±РµР·РѕРїР°СЃРµРЅ. Р”Р»СЏ СЃРµСЂРёР°Р»РёР·Р°С†РёРё РѕРїРµСЂР°С†РёР№ РЅР° СЌР»Р»РёРїС‚РёС‡РµСЃРєРёС…
+// РєСЂРёРІС‹С… РёСЃРїРѕР»СЊР·СѓРµС‚СЃСЏ РІРЅСѓС‚СЂРµРЅРЅРёР№ РјСЊСЋС‚РµРєСЃ (СЃРј. РєРѕРјРјРµРЅС‚Р°СЂРёР№ Рє РїР°РєРµС‚Сѓ).
+type GOSTProvider struct {
+	curve *gost3410.Curve
+
+	// ecMu СЃРµСЂРёР°Р»РёР·СѓРµС‚ РѕРїРµСЂР°С†РёРё РЅР° СЌР»Р»РёРїС‚РёС‡РµСЃРєРёС… РєСЂРёРІС‹С…
+	// (Sign/Verify/Generate/NewPrivate/NewPublic), РїРѕС‚РѕРјСѓ С‡С‚Рѕ
+	// bi-zone РёСЃРїРѕР»СЊР·СѓРµС‚ РЅРµР±РµР·РѕРїР°СЃРЅС‹Рµ РїРѕ РіРѕРЅРєР°Рј РѕР±С‰РёРµ *big.Int-Р±СѓС„РµСЂС‹.
+	ecMu sync.Mutex
+}
+
+// NewGOSTProvider СЃРѕР·РґР°С‘С‚ РїСЂРѕРІР°Р№РґРµСЂ СЃ РєСЂРёРІРѕР№ 256-Р±РёС‚ РёР· РўРљ26.
+func NewGOSTProvider() *GOSTProvider {
+	return &GOSTProvider{
+		curve: gost3410.CurveIdtc26gost34102012256paramSetA(),
+	}
+}
+
+// NewGOSTProviderWithCurve РїРѕР·РІРѕР»СЏРµС‚ Р·Р°РґР°С‚СЊ РєСЂРёРІСѓСЋ СЏРІРЅРѕ.
+func NewGOSTProviderWithCurve(curve *gost3410.Curve) *GOSTProvider {
+	return &GOSTProvider{curve: curve}
+}
+
+// Curve РІРѕР·РІСЂР°С‰Р°РµС‚ РёСЃРїРѕР»СЊР·СѓРµРјСѓСЋ РєСЂРёРІСѓСЋ.
+func (g *GOSTProvider) Curve() *gost3410.Curve {
+	return g.curve
+}
+
+// ---------- РЎС‚СЂРёР±РѕРі (Р“РћРЎРў Р  34.11-2012) ----------
+
+func (g *GOSTProvider) Streebog256(data []byte) []byte {
+	h := gost34112012256.New()
+	h.Write(data)
+	return h.Sum(nil)
+}
+
+func (g *GOSTProvider) NewStreebog256() hash.Hash {
+	return gost34112012256.New()
+}
+
+func (g *GOSTProvider) Streebog512(data []byte) []byte {
+	h := gost34112012512.New()
+	h.Write(data)
+	return h.Sum(nil)
+}
+
+func (g *GOSTProvider) NewStreebog512() hash.Hash {
+	return gost34112012512.New()
+}
+
+// ---------- Р­Р¦Рџ (Р“РћРЎРў Р  34.10-2012) ----------
+
+// GenerateKeyPair РіРµРЅРµСЂРёСЂСѓРµС‚ РЅРѕРІСѓСЋ РїР°СЂСѓ РєР»СЋС‡РµР№.
+// РЎРµСЂРёР°Р»РёР·РѕРІР°РЅРѕ С‡РµСЂРµР· ecMu.
+func (g *GOSTProvider) GenerateKeyPair() (*gost3410.PrivateKey, *gost3410.PublicKey, error) {
+	g.ecMu.Lock()
+	defer g.ecMu.Unlock()
+
+	priv, err := gost3410.GenPrivateKey(g.curve, rand.Reader)
+	if err != nil {
+		return nil, nil, fmt.Errorf("crypto: gen private key: %w", err)
+	}
+	pub, err := priv.PublicKey()
+	if err != nil {
+		return nil, nil, fmt.Errorf("crypto: derive public key: %w", err)
+	}
+	return priv, pub, nil
+}
+
+func (g *GOSTProvider) NewPrivateKeyFromRaw(raw []byte) (*gost3410.PrivateKey, error) {
+	if len(raw) != GOST3410PrivateKeySize {
+		return nil, fmt.Errorf("crypto: private key must be %d bytes, got %d",
+			GOST3410PrivateKeySize, len(raw))
+	}
+	g.ecMu.Lock()
+	defer g.ecMu.Unlock()
+	return gost3410.NewPrivateKey(g.curve, raw)
+}
+
+func (g *GOSTProvider) NewPublicKeyFromRaw(raw []byte) (*gost3410.PublicKey, error) {
+	g.ecMu.Lock()
+	defer g.ecMu.Unlock()
+	return gost3410.NewPublicKey(g.curve, raw)
+}
+
+// SignGOST3410 РїРѕРґРїРёСЃС‹РІР°РµС‚ digest РїСЂРёРІР°С‚РЅС‹Рј РєР»СЋС‡РѕРј.
+// РЎРµСЂРёР°Р»РёР·РѕРІР°РЅРѕ С‡РµСЂРµР· ecMu вЂ” РєСЂРёС‚РёС‡РЅРѕ, РїРѕС‚РѕРјСѓ С‡С‚Рѕ SignDigest РЅРµР±РµР·РѕРїР°СЃРµРЅ
+// РїСЂРё РїР°СЂР°Р»Р»РµР»СЊРЅС‹С… РІС‹Р·РѕРІР°С… РЅР° РѕРґРЅРѕР№ Curve.
+func (g *GOSTProvider) SignGOST3410(
+	priv *gost3410.PrivateKey,
+	digest []byte,
+) ([]byte, error) {
+	if priv == nil {
+		return nil, errors.New("crypto: private key is nil")
+	}
+	if len(digest) != StreebogSize {
+		return nil, fmt.Errorf("crypto: digest must be %d bytes, got %d",
+			StreebogSize, len(digest))
+	}
+
+	g.ecMu.Lock()
+	defer g.ecMu.Unlock()
+
+	sig, err := priv.SignDigest(digest, rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("crypto: sign: %w", err)
+	}
+	if len(sig) != GOST3410SignatureSize {
+		return nil, fmt.Errorf("crypto: unexpected signature size %d, want %d",
+			len(sig), GOST3410SignatureSize)
+	}
+	return sig, nil
+}
+
+// VerifyGOST3410 РїСЂРѕРІРµСЂСЏРµС‚ РїРѕРґРїРёСЃСЊ РїСѓР±Р»РёС‡РЅС‹Рј РєР»СЋС‡РѕРј.
+// РЎРµСЂРёР°Р»РёР·РѕРІР°РЅРѕ С‡РµСЂРµР· ecMu.
+func (g *GOSTProvider) VerifyGOST3410(
+	pub *gost3410.PublicKey,
+	digest []byte,
+	sig []byte,
+) (bool, error) {
+	if pub == nil {
+		return false, errors.New("crypto: public key is nil")
+	}
+	if len(digest) != StreebogSize {
+		return false, fmt.Errorf("crypto: digest must be %d bytes, got %d",
+			StreebogSize, len(digest))
+	}
+	if len(sig) != GOST3410SignatureSize {
+		return false, fmt.Errorf("crypto: signature must be %d bytes, got %d",
+			GOST3410SignatureSize, len(sig))
+	}
+
+	g.ecMu.Lock()
+	defer g.ecMu.Unlock()
+
+	ok, err := pub.VerifyDigest(digest, sig)
+	if err != nil {
+		return false, fmt.Errorf("crypto: verify: %w", err)
+	}
+	return ok, nil
+}
+
+// SignHash СЂРµР°Р»РёР·СѓРµС‚ crypto.Signer.
+func (g *GOSTProvider) SignHash(
+	priv *gost3410.PrivateKey,
+	digest []byte,
+	_ crypto.SignerOpts,
+) ([]byte, error) {
+	if priv == nil {
+		return nil, errors.New("crypto: private key is nil")
+	}
+	g.ecMu.Lock()
+	defer g.ecMu.Unlock()
+	return priv.Sign(rand.Reader, digest, nil)
+}
+
+// ---------- РљСѓР·РЅРµС‡РёРє (Р“РћРЎРў Р  34.12-2015) + MGM AEAD ----------
+
+func newMGM(key []byte) (cipher.AEAD, error) {
+	if len(key) != KuznechikKeySize {
+		return nil, fmt.Errorf("crypto: kuznechik key must be %d bytes, got %d",
+			KuznechikKeySize, len(key))
+	}
+	block := gost3412128.NewCipher(key)
+	aead, err := mgm.NewMGM(block)
+	if err != nil {
+		return nil, fmt.Errorf("crypto: mgm init: %w", err)
+	}
+	return aead, nil
+}
+
+func validateMGMNonce(nonce []byte, wantSize int) error {
+	if len(nonce) != wantSize {
+		return fmt.Errorf("crypto: nonce must be %d bytes, got %d",
+			wantSize, len(nonce))
+	}
+	if nonce[0]&0x80 != 0 {
+		return errors.New("crypto: nonce top bit must be 0 (RFC 9058 MGM)")
+	}
+	return nil
+}
+
+func (g *GOSTProvider) SealMGM(
+	key []byte,
+	nonce []byte,
+	plaintext []byte,
+	additionalData []byte,
+) ([]byte, error) {
+	aead, err := newMGM(key)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateMGMNonce(nonce, aead.NonceSize()); err != nil {
+		return nil, err
+	}
+	if len(plaintext) == 0 && len(additionalData) == 0 {
+		return nil, errors.New("crypto: MGM requires at least plaintext or additionalData")
+	}
+	return aead.Seal(nil, nonce, plaintext, additionalData), nil
+}
+
+func (g *GOSTProvider) OpenMGM(
+	key []byte,
+	nonce []byte,
+	ciphertext []byte,
+	additionalData []byte,
+) ([]byte, error) {
+	aead, err := newMGM(key)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateMGMNonce(nonce, aead.NonceSize()); err != nil {
+		return nil, err
+	}
+	if len(ciphertext) < aead.Overhead() {
+		return nil, fmt.Errorf("crypto: ciphertext shorter than tag (%d < %d)",
+			len(ciphertext), aead.Overhead())
+	}
+	pt, err := aead.Open(nil, nonce, ciphertext, additionalData)
+	if err != nil {
+		return nil, fmt.Errorf("crypto: mgm open: %w", err)
+	}
+	return pt, nil
+}
+
+// ---------- РЈС‚РёР»РёС‚С‹ ----------
+
+func RandomBytes(n int) ([]byte, error) {
+	b := make([]byte, n)
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+func RandomMGMNonce() ([]byte, error) {
+	nonce, err := RandomBytes(MGMNonceSize)
+	if err != nil {
+		return nil, err
+	}
+	nonce[0] &= 0x7F
+	return nonce, nil
+}
+
+// OracleResponseDigest С„РѕСЂРјРёСЂСѓРµС‚ digest РґР»СЏ РїРѕРґРїРёСЃРё РѕС‚РІРµС‚Р° РѕСЂР°РєСѓР»Р°
+// Р РѕСЃСЂРµРµСЃС‚СЂР°. Р•РґРёРЅР°СЏ С‚РѕС‡РєР°: Рё engine, Рё oracle, Рё cmd/oracle-rosreestr
+// РёСЃРїРѕР»СЊР·СѓСЋС‚ СЌС‚РѕС‚ РјРµС‚РѕРґ, С‡С‚РѕР±С‹ РєРѕРЅС‚СЂР°РєС‚ РјРµР¶РґСѓ СЃРµСЂРІРёСЃР°РјРё Р±С‹Р» РѕРґРёРЅ.
+//
+// Р¤РѕСЂРјР°С‚: РЎС‚СЂРёР±РѕРі-256("dealID:kadastr:success").
+func (g *GOSTProvider) OracleResponseDigest(dealID, kadastr string, success bool) []byte {
+	return g.Streebog256(fmt.Appendf(nil, "%s:%s:%t", dealID, kadastr, success))
+}
+
+
+// ============================================
+// FILE: gost_test.go
+// ============================================
+package crypto
+
+import (
+	"bytes"
+	"testing"
+)
+
+func TestStreebog256_Length(t *testing.T) {
+	g := NewGOSTProvider()
+	h := g.Streebog256([]byte("test"))
+	if len(h) != StreebogSize {
+		t.Fatalf("Streebog256: got %d bytes, want %d", len(h), StreebogSize)
+	}
+}
+
+func TestStreebog512_Length(t *testing.T) {
+	g := NewGOSTProvider()
+	h := g.Streebog512([]byte("test"))
+	if len(h) != Streebog512Size {
+		t.Fatalf("Streebog512: got %d bytes, want %d", len(h), Streebog512Size)
+	}
+}
+
+func TestStreebog256_Deterministic(t *testing.T) {
+	g := NewGOSTProvider()
+	in := []byte("Р¦РёС„СЂРѕРІР°СЏ РќРРЎ вЂ” С‚РµСЃС‚ РґРµС‚РµСЂРјРёРЅРёР·РјР°")
+	h1 := g.Streebog256(in)
+	h2 := g.Streebog256(in)
+	if !bytes.Equal(h1, h2) {
+		t.Fatal("Streebog256 not deterministic")
+	}
+}
+
+func TestStreebog256_DifferentInputs(t *testing.T) {
+	g := NewGOSTProvider()
+	h1 := g.Streebog256([]byte("a"))
+	h2 := g.Streebog256([]byte("b"))
+	if bytes.Equal(h1, h2) {
+		t.Fatal("different inputs produced identical hash")
+	}
+}
+
+func TestStreebog256_EmptyInput(t *testing.T) {
+	g := NewGOSTProvider()
+	h := g.Streebog256(nil)
+	if len(h) != StreebogSize {
+		t.Fatalf("empty input: got %d bytes, want %d", len(h), StreebogSize)
+	}
+}
+
+func TestGOST3410_SignVerify_Roundtrip(t *testing.T) {
+	g := NewGOSTProvider()
+	priv, pub, err := g.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	digest := g.Streebog256([]byte("hello NIS"))
+	sig, err := g.SignGOST3410(priv, digest)
+	if err != nil {
+		t.Fatalf("SignGOST3410: %v", err)
+	}
+	if len(sig) != GOST3410SignatureSize {
+		t.Fatalf("sig size = %d, want %d", len(sig), GOST3410SignatureSize)
+	}
+	ok, err := g.VerifyGOST3410(pub, digest, sig)
+	if err != nil {
+		t.Fatalf("VerifyGOST3410: %v", err)
+	}
+	if !ok {
+		t.Fatal("valid signature rejected")
+	}
+}
+
+func TestGOST3410_RejectTamperedDigest(t *testing.T) {
+	g := NewGOSTProvider()
+	priv, pub, _ := g.GenerateKeyPair()
+	digest := g.Streebog256([]byte("hello NIS"))
+	sig, _ := g.SignGOST3410(priv, digest)
+
+	tampered := make([]byte, len(digest))
+	copy(tampered, digest)
+	tampered[0] ^= 0x01
+
+	ok, err := g.VerifyGOST3410(pub, tampered, sig)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if ok {
+		t.Fatal("tampered digest accepted")
+	}
+}
+
+func TestGOST3410_RejectWrongKey(t *testing.T) {
+	g := NewGOSTProvider()
+	priv1, _, _ := g.GenerateKeyPair()
+	_, pub2, _ := g.GenerateKeyPair()
+
+	digest := g.Streebog256([]byte("hello NIS"))
+	sig, _ := g.SignGOST3410(priv1, digest)
+
+	ok, _ := g.VerifyGOST3410(pub2, digest, sig)
+	if ok {
+		t.Fatal("signature verified with wrong public key")
+	}
+}
+
+func TestGOST3410_WrongDigestSize(t *testing.T) {
+	g := NewGOSTProvider()
+	priv, _, _ := g.GenerateKeyPair()
+	if _, err := g.SignGOST3410(priv, []byte("short")); err == nil {
+		t.Fatal("expected error for short digest")
+	}
+}
+
+func TestGOST3410_WrongSignatureSize(t *testing.T) {
+	g := NewGOSTProvider()
+	_, pub, _ := g.GenerateKeyPair()
+	digest := g.Streebog256([]byte("x"))
+	if _, err := g.VerifyGOST3410(pub, digest, make([]byte, 10)); err == nil {
+		t.Fatal("expected error for wrong signature size")
+	}
+}
+
+func TestNewPrivateKeyFromRaw_WrongSize(t *testing.T) {
+	g := NewGOSTProvider()
+	if _, err := g.NewPrivateKeyFromRaw(make([]byte, 16)); err == nil {
+		t.Fatal("expected error for wrong private key size")
+	}
+}
+
+// ---------- MGM ----------
+
+func TestRandomMGMNonce_Valid(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		nonce, err := RandomMGMNonce()
+		if err != nil {
+			t.Fatalf("RandomMGMNonce: %v", err)
+		}
+		if len(nonce) != MGMNonceSize {
+			t.Fatalf("nonce size = %d, want %d", len(nonce), MGMNonceSize)
+		}
+		if nonce[0]&0x80 != 0 {
+			t.Fatalf("nonce top bit set: %#x", nonce[0])
+		}
+	}
+}
+
+func TestMGM_SealOpen_Roundtrip(t *testing.T) {
+	g := NewGOSTProvider()
+	key, _ := RandomBytes(KuznechikKeySize)
+	nonce, _ := RandomMGMNonce()
+	plaintext := []byte("РџРµСЂРµРІРѕРґ 4 850 000 СЂСѓР±. РЅР° СЌСЃРєСЂРѕСѓ-СЃС‡С‘С‚ РџРРљ")
+	aad := []byte("dealID=DEAL-001")
+
+	ct, err := g.SealMGM(key, nonce, plaintext, aad)
+	if err != nil {
+		t.Fatalf("SealMGM: %v", err)
+	}
+	if bytes.Equal(ct, plaintext) {
+		t.Fatal("ciphertext equals plaintext")
+	}
+
+	pt, err := g.OpenMGM(key, nonce, ct, aad)
+	if err != nil {
+		t.Fatalf("OpenMGM: %v", err)
+	}
+	if !bytes.Equal(pt, plaintext) {
+		t.Fatalf("roundtrip mismatch:\n got: %q\nwant: %q", pt, plaintext)
+	}
+}
+
+func TestMGM_RejectTamperedCiphertext(t *testing.T) {
+	g := NewGOSTProvider()
+	key, _ := RandomBytes(KuznechikKeySize)
+	nonce, _ := RandomMGMNonce()
+	pt := []byte("payload")
+	aad := []byte("aad")
+
+	ct, err := g.SealMGM(key, nonce, pt, aad)
+	if err != nil {
+		t.Fatalf("SealMGM: %v", err)
+	}
+	if len(ct) == 0 {
+		t.Fatal("empty ciphertext")
+	}
+	ct[0] ^= 0x01
+
+	if _, err := g.OpenMGM(key, nonce, ct, aad); err == nil {
+		t.Fatal("tampered ciphertext accepted")
+	}
+}
+
+func TestMGM_RejectWrongAAD(t *testing.T) {
+	g := NewGOSTProvider()
+	key, _ := RandomBytes(KuznechikKeySize)
+	nonce, _ := RandomMGMNonce()
+	pt := []byte("payload")
+
+	ct, err := g.SealMGM(key, nonce, pt, []byte("aad-1"))
+	if err != nil {
+		t.Fatalf("SealMGM: %v", err)
+	}
+	if _, err := g.OpenMGM(key, nonce, ct, []byte("aad-2")); err == nil {
+		t.Fatal("wrong AAD accepted")
+	}
+}
+
+func TestMGM_RejectWrongNonce(t *testing.T) {
+	g := NewGOSTProvider()
+	key, _ := RandomBytes(KuznechikKeySize)
+	nonce, _ := RandomMGMNonce()
+	pt := []byte("payload")
+
+	ct, err := g.SealMGM(key, nonce, pt, nil)
+	if err != nil {
+		t.Fatalf("SealMGM: %v", err)
+	}
+
+	// Р”СЂСѓРіРѕР№ РІР°Р»РёРґРЅС‹Р№ nonce.
+	badNonce, _ := RandomMGMNonce()
+	if _, err := g.OpenMGM(key, badNonce, ct, nil); err == nil {
+		t.Fatal("wrong nonce accepted")
+	}
+}
+
+func TestSealMGM_WrongKeySize(t *testing.T) {
+	g := NewGOSTProvider()
+	nonce, _ := RandomMGMNonce()
+	_, err := g.SealMGM(make([]byte, 16), nonce, []byte("x"), nil)
+	if err == nil {
+		t.Fatal("expected error for wrong key size")
+	}
+}
+
+func TestSealMGM_WrongNonceSize(t *testing.T) {
+	g := NewGOSTProvider()
+	key, _ := RandomBytes(KuznechikKeySize)
+	_, err := g.SealMGM(key, make([]byte, 4), []byte("x"), nil)
+	if err == nil {
+		t.Fatal("expected error for wrong nonce size")
+	}
+}
+
+func TestSealMGM_NonceTopBitSet(t *testing.T) {
+	g := NewGOSTProvider()
+	key, _ := RandomBytes(KuznechikKeySize)
+	nonce, _ := RandomMGMNonce()
+	nonce[0] |= 0x80 // Р’С‹СЃС‚Р°РІР»СЏРµРј СЃС‚Р°СЂС€РёР№ Р±РёС‚.
+	_, err := g.SealMGM(key, nonce, []byte("x"), nil)
+	if err == nil {
+		t.Fatal("expected error for nonce with top bit set")
+	}
+}
+
+
+// ============================================
+// FILE: merkle.go
+// ============================================
+package crypto
+
+import (
+	"errors"
+	"fmt"
+)
+
+// MerkleNode вЂ” СѓР·РµР» РґРµСЂРµРІР° РњРµСЂРєР»Р°.
+type MerkleNode struct {
+	Left     *MerkleNode
+	Right    *MerkleNode
+	Parent   *MerkleNode
+	Hash     []byte
+	LeafData []byte
+}
+
+// MerkleTree вЂ” РґРµСЂРµРІРѕ РњРµСЂРєР»Р° РґР»СЏ Р°СѓРґРёС‚Р° СЂРµРµСЃС‚СЂР°.
+type MerkleTree struct {
+	Root   *MerkleNode
+	Leaves []*MerkleNode
+}
+
+const (
+	merkleLeafPrefix = 0x00
+	merkleNodePrefix = 0x01
+)
+
+// ErrEmptyTree РІРѕР·РІСЂР°С‰Р°РµС‚СЃСЏ РїСЂРё РїРѕРїС‹С‚РєРµ РїРѕСЃС‚СЂРѕРёС‚СЊ РґРµСЂРµРІРѕ Р±РµР· РґР°РЅРЅС‹С….
+var ErrEmptyTree = errors.New("merkle: cannot build tree from empty slice")
+
+// BuildMerkleTree СЃС‚СЂРѕРёС‚ РґРµСЂРµРІРѕ РњРµСЂРєР»Р° РёР· СЃРїРёСЃРєР° Р»РёСЃС‚РѕРІС‹С… Р·РЅР°С‡РµРЅРёР№.
+func BuildMerkleTree(g *GOSTProvider, data [][]byte) (*MerkleTree, error) {
+	if len(data) == 0 {
+		return nil, ErrEmptyTree
+	}
+
+	leaves := make([]*MerkleNode, len(data))
+	for i, d := range data {
+		leaves[i] = &MerkleNode{
+			Hash:     hashLeaf(g, d),
+			LeafData: d,
+		}
+	}
+
+	level := leaves
+	for len(level) > 1 {
+		if len(level)%2 == 1 {
+			level = append(level, level[len(level)-1])
+		}
+		next := make([]*MerkleNode, 0, len(level)/2)
+		for i := 0; i < len(level); i += 2 {
+			parent := hashPair(g, level[i], level[i+1])
+			level[i].Parent = parent
+			level[i+1].Parent = parent
+			next = append(next, parent)
+		}
+		level = next
+	}
+
+	return &MerkleTree{Root: level[0], Leaves: leaves}, nil
+}
+
+func hashLeaf(g *GOSTProvider, data []byte) []byte {
+	buf := make([]byte, 0, 1+len(data))
+	buf = append(buf, merkleLeafPrefix)
+	buf = append(buf, data...)
+	return g.Streebog256(buf)
+}
+
+func hashPair(g *GOSTProvider, left, right *MerkleNode) *MerkleNode {
+	buf := make([]byte, 0, 1+len(left.Hash)+len(right.Hash))
+	buf = append(buf, merkleNodePrefix)
+	buf = append(buf, left.Hash...)
+	buf = append(buf, right.Hash...)
+	return &MerkleNode{Left: left, Right: right, Hash: g.Streebog256(buf)}
+}
+
+// RootHash РІРѕР·РІСЂР°С‰Р°РµС‚ РєРѕСЂРЅРµРІРѕР№ С…СЌС€ РґРµСЂРµРІР°.
+func (t *MerkleTree) RootHash() []byte {
+	if t == nil || t.Root == nil {
+		return nil
+	}
+	return t.Root.Hash
+}
+
+// Size РІРѕР·РІСЂР°С‰Р°РµС‚ РєРѕР»РёС‡РµСЃС‚РІРѕ Р»РёСЃС‚СЊРµРІ.
+func (t *MerkleTree) Size() int {
+	if t == nil {
+		return 0
+	}
+	return len(t.Leaves)
+}
+
+// Proof вЂ” РґРѕРєР°Р·Р°С‚РµР»СЊСЃС‚РІРѕ РњРµСЂРєР»Р° РґР»СЏ РєРѕРЅРєСЂРµС‚РЅРѕРіРѕ Р»РёСЃС‚Р°.
+type Proof struct {
+	LeafHash []byte
+	Siblings []ProofStep
+}
+
+// ProofStep вЂ” РѕРґРёРЅ С€Р°Рі РґРѕРєР°Р·Р°С‚РµР»СЊСЃС‚РІР°.
+type ProofStep struct {
+	Hash   []byte
+	IsLeft bool
+}
+
+// Prove РІРѕР·РІСЂР°С‰Р°РµС‚ РґРѕРєР°Р·Р°С‚РµР»СЊСЃС‚РІРѕ РІРєР»СЋС‡РµРЅРёСЏ РґР»СЏ Р»РёСЃС‚Р° СЃ РёРЅРґРµРєСЃРѕРј idx.
+func (t *MerkleTree) Prove(idx int) (*Proof, error) {
+	if t == nil || t.Root == nil {
+		return nil, errors.New("merkle: nil tree")
+	}
+	if idx < 0 || idx >= len(t.Leaves) {
+		return nil, fmt.Errorf("merkle: leaf index %d out of range [0,%d)",
+			idx, len(t.Leaves))
+	}
+
+	leaf := t.Leaves[idx]
+	proof := &Proof{LeafHash: leaf.Hash}
+
+	cur := leaf
+	for cur.Parent != nil {
+		parent := cur.Parent
+		var sib *MerkleNode
+		var isLeft bool
+		if parent.Left == cur {
+			sib = parent.Right
+			isLeft = false
+		} else {
+			sib = parent.Left
+			isLeft = true
+		}
+		proof.Siblings = append(proof.Siblings, ProofStep{Hash: sib.Hash, IsLeft: isLeft})
+		cur = parent
+	}
+
+	return proof, nil
+}
+
+// VerifyProof РїСЂРѕРІРµСЂСЏРµС‚ РґРѕРєР°Р·Р°С‚РµР»СЊСЃС‚РІРѕ РІРєР»СЋС‡РµРЅРёСЏ Р»РёСЃС‚Р° РІ РґРµСЂРµРІРѕ.
+func VerifyProof(g *GOSTProvider, root []byte, proof *Proof) bool {
+	if proof == nil || len(proof.LeafHash) == 0 {
+		return false
+	}
+	cur := proof.LeafHash
+	for _, step := range proof.Siblings {
+		if step.IsLeft {
+			cur = hashPair(g,
+				&MerkleNode{Hash: step.Hash},
+				&MerkleNode{Hash: cur},
+			).Hash
+		} else {
+			cur = hashPair(g,
+				&MerkleNode{Hash: cur},
+				&MerkleNode{Hash: step.Hash},
+			).Hash
+		}
+	}
+	return bytesEqual(cur, root)
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+
+// ============================================
+// FILE: merkle_test.go
+// ============================================
+package crypto
+
+import (
+	"bytes"
+	"fmt"
+	"testing"
+)
+
+func TestMerkleTree_SingleLeaf(t *testing.T) {
+	g := NewGOSTProvider()
+	tree, err := BuildMerkleTree(g, [][]byte{[]byte("only")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tree.Size() != 1 {
+		t.Fatalf("size = %d, want 1", tree.Size())
+	}
+	if tree.RootHash() == nil {
+		t.Fatal("nil root hash")
+	}
+}
+
+func TestMerkleTree_EmptyError(t *testing.T) {
+	g := NewGOSTProvider()
+	if _, err := BuildMerkleTree(g, nil); err == nil {
+		t.Fatal("expected error for empty tree")
+	}
+}
+
+func TestMerkleTree_RootDeterministic(t *testing.T) {
+	g := NewGOSTProvider()
+	data := [][]byte{[]byte("a"), []byte("b"), []byte("c"), []byte("d")}
+	t1, _ := BuildMerkleTree(g, data)
+	t2, _ := BuildMerkleTree(g, data)
+	if !bytes.Equal(t1.RootHash(), t2.RootHash()) {
+		t.Fatal("root hash not deterministic")
+	}
+}
+
+func TestMerkleTree_DifferentDataDifferentRoot(t *testing.T) {
+	g := NewGOSTProvider()
+	t1, _ := BuildMerkleTree(g, [][]byte{[]byte("a"), []byte("b")})
+	t2, _ := BuildMerkleTree(g, [][]byte{[]byte("a"), []byte("c")})
+	if bytes.Equal(t1.RootHash(), t2.RootHash()) {
+		t.Fatal("different data produced same root")
+	}
+}
+
+func TestMerkleTree_ProveAndVerify(t *testing.T) {
+	g := NewGOSTProvider()
+	data := [][]byte{
+		[]byte("tx-1"),
+		[]byte("tx-2"),
+		[]byte("tx-3"),
+		[]byte("tx-4"),
+		[]byte("tx-5"),
+	}
+	tree, _ := BuildMerkleTree(g, data)
+	for i := range data {
+		proof, err := tree.Prove(i)
+		if err != nil {
+			t.Fatalf("prove[%d]: %v", i, err)
+		}
+		if !VerifyProof(g, tree.RootHash(), proof) {
+			t.Fatalf("verify[%d] failed", i)
+		}
+	}
+}
+
+func TestMerkleTree_RejectTamperedProof(t *testing.T) {
+	g := NewGOSTProvider()
+	data := [][]byte{[]byte("tx-1"), []byte("tx-2"), []byte("tx-3"), []byte("tx-4")}
+	tree, _ := BuildMerkleTree(g, data)
+
+	proof, _ := tree.Prove(2)
+	proof.LeafHash[0] ^= 0x01
+
+	if VerifyProof(g, tree.RootHash(), proof) {
+		t.Fatal("tampered proof accepted")
+	}
+}
+
+func TestMerkleTree_ProveOutOfRange(t *testing.T) {
+	g := NewGOSTProvider()
+	tree, _ := BuildMerkleTree(g, [][]byte{[]byte("a"), []byte("b")})
+	if _, err := tree.Prove(5); err == nil {
+		t.Fatal("expected error for out-of-range index")
+	}
+	if _, err := tree.Prove(-1); err == nil {
+		t.Fatal("expected error for negative index")
+	}
+}
+
+func TestMerkleTree_OddNumberOfLeaves(t *testing.T) {
+	g := NewGOSTProvider()
+	data := [][]byte{[]byte("a"), []byte("b"), []byte("c")}
+	tree, _ := BuildMerkleTree(g, data)
+	for i := range data {
+		proof, err := tree.Prove(i)
+		if err != nil {
+			t.Fatalf("prove[%d]: %v", i, err)
+		}
+		if !VerifyProof(g, tree.RootHash(), proof) {
+			t.Fatalf("verify[%d] failed (odd leaves)", i)
+		}
+	}
+}
+
+func TestMerkleTree_LargeTree(t *testing.T) {
+	g := NewGOSTProvider()
+	data := make([][]byte, 100)
+	for i := range data {
+		data[i] = fmt.Appendf(nil, "tx-%d", i)
+	}
+	tree, _ := BuildMerkleTree(g, data)
+	if tree.Size() != 100 {
+		t.Fatalf("size = %d, want 100", tree.Size())
+	}
+	for _, i := range []int{0, 1, 50, 99} {
+		proof, _ := tree.Prove(i)
+		if !VerifyProof(g, tree.RootHash(), proof) {
+			t.Fatalf("verify[%d] failed in large tree", i)
+		}
+	}
+}
+
+
+// ============================================
+// FILE: escrow_engine.go
+// ============================================
+package engine
+
+import (
+	"crypto/subtle"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bi-zone/ruwireguard-go/crypto/gost/gost3410"
+
+	"nis-core/internal/crypto"
+)
+
+// DefaultLockDuration вЂ” СЃСЂРѕРє С‚Р°Р№Рј-Р»РѕРєР° РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ (30 СЃСѓС‚РѕРє).
+const DefaultLockDuration = 30 * 24 * time.Hour
+
+// Sentinel-РѕС€РёР±РєРё РґРІРёР¶РєР°.
+var (
+	ErrTokenMisuse      = errors.New("engine: token color tag mismatch")
+	ErrIssuerSigInvalid = errors.New("engine: issuer signature invalid")
+	ErrOracleSigInvalid = errors.New("engine: oracle signature invalid")
+	ErrContractExpired  = errors.New("engine: escrow contract expired")
+	ErrInvalidState     = errors.New("engine: invalid state transition")
+	ErrInvalidArgument  = errors.New("engine: invalid argument")
+)
+
+// SmartContractEngine вЂ” РґРµС‚РµСЂРјРёРЅРёСЂРѕРІР°РЅРЅС‹Р№ РґРІРёР¶РѕРє СЌСЃРєСЂРѕСѓ-РєРѕРЅС‚СЂР°РєС‚РѕРІ РќРРЎ.
+type SmartContractEngine struct {
+	ledger  Ledger
+	crypto  *crypto.GOSTProvider
+	pubVoen *gost3410.PublicKey
+	pubRosr *gost3410.PublicKey
+	now     func() int64
+}
+
+// NewSmartContractEngine СЃРѕР·РґР°С‘С‚ РґРІРёР¶РѕРє.
+func NewSmartContractEngine(
+	ledger Ledger,
+	g *crypto.GOSTProvider,
+	pubVoen *gost3410.PublicKey,
+	pubRosr *gost3410.PublicKey,
+) (*SmartContractEngine, error) {
+	if ledger == nil {
+		return nil, fmt.Errorf("%w: nil ledger", ErrInvalidArgument)
+	}
+	if g == nil {
+		return nil, fmt.Errorf("%w: nil crypto provider", ErrInvalidArgument)
+	}
+	if pubVoen == nil {
+		return nil, fmt.Errorf("%w: nil issuer public key", ErrInvalidArgument)
+	}
+	if pubRosr == nil {
+		return nil, fmt.Errorf("%w: nil oracle public key", ErrInvalidArgument)
+	}
+	return &SmartContractEngine{
+		ledger:  ledger,
+		crypto:  g,
+		pubVoen: pubVoen,
+		pubRosr: pubRosr,
+		now:     func() int64 { return time.Now().Unix() },
+	}, nil
+}
+
+// SetClock Р·Р°РјРµРЅСЏРµС‚ РёСЃС‚РѕС‡РЅРёРє РІСЂРµРјРµРЅРё. РўРѕР»СЊРєРѕ РґР»СЏ С‚РµСЃС‚РѕРІ.
+func (e *SmartContractEngine) SetClock(fn func() int64) {
+	if fn != nil {
+		e.now = fn
+	}
+}
+
+// Close РѕСЃРІРѕР±РѕР¶РґР°РµС‚ СЂРµСЃСѓСЂСЃС‹ Р»РµРґР¶РµСЂР°.
+func (e *SmartContractEngine) Close() error {
+	return e.ledger.Close()
+}
+
+// ---------- Р’СЃРїРѕРјРѕРіР°С‚РµР»СЊРЅС‹Рµ РІС‹С‡РёСЃР»РµРЅРёСЏ ----------
+
+// ComputeColorTag РІРѕР·РІСЂР°С‰Р°РµС‚ СЌС‚Р°Р»РѕРЅРЅС‹Р№ С‚РµРі РѕРєСЂР°С€РёРІР°РЅРёСЏ:
+// hex(РЎС‚СЂРёР±РѕРі-256(INN || ":" || KadastrNo)).
+func ComputeColorTag(g *crypto.GOSTProvider, inn, kadastr string) string {
+	payload := inn + ":" + kadastr
+	return hex.EncodeToString(g.Streebog256([]byte(payload)))
+}
+
+func (e *SmartContractEngine) issuerDigest(tokenID, colorTag string) []byte {
+	return e.crypto.Streebog256([]byte(tokenID + ":" + colorTag))
+}
+
+func (e *SmartContractEngine) oracleDigest(dealID, kadastr string, success bool) []byte {
+	return e.crypto.OracleResponseDigest(dealID, kadastr, success)
+}
+
+func newRandomID() (string, error) {
+	b, err := crypto.RandomBytes(32)
+	if err != nil {
+		return "", fmt.Errorf("engine: random id: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// ---------- Р­РјРёСЃСЃРёСЏ ----------
+
+// IssueColoredRubles РІС‹РїСѓСЃРєР°РµС‚ В«РѕРєСЂР°С€РµРЅРЅС‹Р№В» С†РёС„СЂРѕРІРѕР№ СЂСѓР±Р»СЊ РќРРЎ.
+func (e *SmartContractEngine) IssueColoredRubles(
+	amount uint64,
+	militaryHash string,
+	developerINN string,
+	kadastr string,
+	issuerPriv *gost3410.PrivateKey,
+) (*DigitalNISRubles, error) {
+	if amount == 0 {
+		return nil, fmt.Errorf("%w: amount must be > 0", ErrInvalidArgument)
+	}
+	if militaryHash == "" {
+		return nil, fmt.Errorf("%w: empty militaryHash", ErrInvalidArgument)
+	}
+	if developerINN == "" {
+		return nil, fmt.Errorf("%w: empty developerINN", ErrInvalidArgument)
+	}
+	if kadastr == "" {
+		return nil, fmt.Errorf("%w: empty kadastr", ErrInvalidArgument)
+	}
+	if issuerPriv == nil {
+		return nil, fmt.Errorf("%w: nil issuer private key", ErrInvalidArgument)
+	}
+
+	colorTag := ComputeColorTag(e.crypto, developerINN, kadastr)
+	nonce, err := newRandomID()
+	if err != nil {
+		return nil, err
+	}
+	tokenID := hex.EncodeToString(
+		e.crypto.Streebog256([]byte(militaryHash + ":" + colorTag + ":" + nonce)),
+	)
+
+	token := &DigitalNISRubles{
+		TokenID:         tokenID,
+		Amount:          amount,
+		TargetColorTag:  colorTag,
+		MilitaryIDHash:  militaryHash,
+		BeneficiaryINN:  developerINN,
+		CadastralNumber: kadastr,
+		IssuedAt:        e.now(),
+	}
+
+	digest := e.issuerDigest(token.TokenID, token.TargetColorTag)
+	sig, err := e.crypto.SignGOST3410(issuerPriv, digest)
+	if err != nil {
+		return nil, fmt.Errorf("engine: sign issue: %w", err)
+	}
+	token.IssuerSignature = sig
+	return token, nil
+}
+
+// ---------- Р‘Р»РѕРєРёСЂРѕРІРєР° ----------
+
+// LockInEscrow РёРЅРёС†РёРёСЂСѓРµС‚ СЃРґРµР»РєСѓ: РїСЂРѕРІРµСЂСЏРµС‚ С‚РѕРєРµРЅ Рё С„РёРєСЃРёСЂСѓРµС‚ РµРіРѕ
+// РІ СЂРµРµСЃС‚СЂРµ СЃ СѓРєР°Р·Р°РЅРЅС‹Рј С‚Р°Р№Рј-Р»РѕРєРѕРј.
+func (e *SmartContractEngine) LockInEscrow(
+	dealID string,
+	token *DigitalNISRubles,
+	lockDuration time.Duration,
+) error {
+	if dealID == "" {
+		return fmt.Errorf("%w: empty dealID", ErrInvalidArgument)
+	}
+	if token == nil {
+		return fmt.Errorf("%w: nil token", ErrInvalidArgument)
+	}
+	if lockDuration <= 0 {
+		return fmt.Errorf("%w: lockDuration must be > 0", ErrInvalidArgument)
+	}
+	if err := token.Validate(); err != nil {
+		return fmt.Errorf("%w: token: %v", ErrInvalidArgument, err)
+	}
+
+	expectedTag := ComputeColorTag(e.crypto, token.BeneficiaryINN, token.CadastralNumber)
+	if subtle.ConstantTimeCompare(
+		[]byte(token.TargetColorTag),
+		[]byte(expectedTag),
+	) != 1 {
+		return ErrTokenMisuse
+	}
+
+	digest := e.issuerDigest(token.TokenID, token.TargetColorTag)
+	ok, err := e.crypto.VerifyGOST3410(e.pubVoen, digest, token.IssuerSignature)
+	if err != nil {
+		return fmt.Errorf("engine: verify issuer sig: %w", err)
+	}
+	if !ok {
+		return ErrIssuerSigInvalid
+	}
+
+	now := e.now()
+	contract := &EscrowContract{
+		DealID:    dealID,
+		Token:     *token,
+		Status:    StatusLocked,
+		CreatedAt: now,
+		UpdatedAt: now,
+		TimeoutAt: now + int64(lockDuration.Seconds()),
+	}
+
+	if err := e.ledger.PutEscrow(dealID, contract); err != nil {
+		return fmt.Errorf("engine: lock in escrow: %w", err)
+	}
+	return nil
+}
+
+// ---------- РћР±СЂР°Р±РѕС‚РєР° РѕСЂР°РєСѓР»Р° ----------
+
+// ProcessRosreestrCallback РѕР±СЂР°Р±Р°С‚С‹РІР°РµС‚ РѕС‚РІРµС‚ РѕСЂР°РєСѓР»Р° Р РѕСЃСЂРµРµСЃС‚СЂР°.
+//
+// Р•СЃР»Рё С‚Р°Р№Рј-Р»РѕРє РёСЃС‚С‘Рє вЂ” СЃСЂРµРґСЃС‚РІР° РІРѕР·РІСЂР°С‰Р°СЋС‚СЃСЏ СЌРјРёС‚РµРЅС‚Сѓ (С‡РµСЂРµР·
+// РѕС‚РґРµР»СЊРЅС‹Р№ Р°С‚РѕРјР°СЂРЅС‹Р№ РІС‹Р·РѕРІ RefundExpired), Р·Р°С‚РµРј РІРѕР·РІСЂР°С‰Р°РµС‚СЃСЏ
+// ErrContractExpired РєР°Рє СЃРёРіРЅР°Р» В«СЃРґРµР»РєР° РЅРµ Р·Р°РІРµСЂС€РёР»Р°СЃСЊВ».
+func (e *SmartContractEngine) ProcessRosreestrCallback(
+	dealID string,
+	kadastr string,
+	success bool,
+	oracleSig []byte,
+) error {
+	if dealID == "" {
+		return fmt.Errorf("%w: empty dealID", ErrInvalidArgument)
+	}
+	if len(oracleSig) == 0 {
+		return fmt.Errorf("%w: empty oracle signature", ErrInvalidArgument)
+	}
+
+	// РџСЂРµРґРІР°СЂРёС‚РµР»СЊРЅР°СЏ РїСЂРѕРІРµСЂРєР° СЃС‚Р°С‚СѓСЃР° Рё С‚Р°Р№Рј-Р»РѕРєР°.
+	contract, err := e.ledger.GetEscrow(dealID)
+	if err != nil {
+		return err
+	}
+	if contract.Status != StatusLocked {
+		return ErrInvalidState
+	}
+	if e.now() > contract.TimeoutAt {
+		if err := e.RefundExpired(dealID); err != nil {
+			return fmt.Errorf("engine: auto-refund after timeout: %w", err)
+		}
+		return ErrContractExpired
+	}
+
+	// РћСЃРЅРѕРІРЅРѕР№ РїСѓС‚СЊ: Р°С‚РѕРјР°СЂРЅР°СЏ РѕР±СЂР°Р±РѕС‚РєР° РєРѕР»Р±СЌРєР°.
+	return e.ledger.UpdateEscrow(dealID, func(c *EscrowContract) error {
+		// РџРѕРІС‚РѕСЂРЅР°СЏ РїСЂРѕРІРµСЂРєР° вЂ” РјРµР¶РґСѓ Get Рё Update РјРѕРіР»Рѕ
+		// РїСЂРѕРёР·РѕР№С‚Рё РєРѕРЅРєСѓСЂРµРЅС‚РЅРѕРµ РёР·РјРµРЅРµРЅРёРµ.
+		if c.Status != StatusLocked {
+			return ErrInvalidState
+		}
+
+		digest := e.oracleDigest(dealID, kadastr, success)
+		ok, err := e.crypto.VerifyGOST3410(e.pubRosr, digest, oracleSig)
+		if err != nil {
+			return fmt.Errorf("engine: verify oracle sig: %w", err)
+		}
+		if !ok {
+			return ErrOracleSigInvalid
+		}
+
+		if subtle.ConstantTimeCompare(
+			[]byte(kadastr),
+			[]byte(c.Token.CadastralNumber),
+		) != 1 {
+			return ErrTokenMisuse
+		}
+
+		if !success {
+			return e.refundLocked(c, "rosreestr rejected registration")
+		}
+
+		txID, err := newRandomID()
+		if err != nil {
+			return err
+		}
+		c.Status = StatusReleased
+		c.RosreestrProof = append([]byte(nil), oracleSig...)
+		c.SettlementTxID = txID
+		c.UpdatedAt = e.now()
+		return nil
+	})
+}
+
+// refundLocked Р·Р°РїРѕР»РЅСЏРµС‚ РїРѕР»СЏ РІРѕР·РІСЂР°С‚Р°. Р’С‹Р·С‹РІР°РµС‚СЃСЏ С‚РѕР»СЊРєРѕ РІРЅСѓС‚СЂРё
+// UpdateEscrow, РїРѕСЌС‚РѕРјСѓ СЃРѕР±СЃС‚РІРµРЅРЅС‹С… РѕР±СЂР°С‰РµРЅРёР№ Рє Ledger РЅРµ РґРµР»Р°РµС‚.
+func (e *SmartContractEngine) refundLocked(c *EscrowContract, reason string) error {
+	c.Status = StatusRefunded
+	c.RefundReason = reason
+	c.UpdatedAt = e.now()
+	return nil
+}
+
+// ---------- РџСЂРёРЅСѓРґРёС‚РµР»СЊРЅС‹Р№ РІРѕР·РІСЂР°С‚ ----------
+
+// RefundExpired РІРѕР·РІСЂР°С‰Р°РµС‚ СЃСЂРµРґСЃС‚РІР°, РµСЃР»Рё С‚Р°Р№Рј-Р»РѕРє РёСЃС‚С‘Рє.
+// РРґРµРјРїРѕС‚РµРЅС‚РµРЅ: РЅР° СѓР¶Рµ Р·Р°РІРµСЂС€С‘РЅРЅС‹С… РёР»Рё РЅРµРёСЃС‚С‘РєС€РёС… РєРѕРЅС‚СЂР°РєС‚Р°С…
+// РІРѕР·РІСЂР°С‰Р°РµС‚ nil Р±РµР· РёР·РјРµРЅРµРЅРёР№. РџСЂРµРґРЅР°Р·РЅР°С‡РµРЅ РґР»СЏ РІС‹Р·РѕРІР° РїРѕ РєСЂРѕРЅСѓ.
+func (e *SmartContractEngine) RefundExpired(dealID string) error {
+	if dealID == "" {
+		return fmt.Errorf("%w: empty dealID", ErrInvalidArgument)
+	}
+	return e.ledger.UpdateEscrow(dealID, func(c *EscrowContract) error {
+		if c.Status == StatusRefunded || c.Status == StatusReleased {
+			return nil
+		}
+		if c.Status != StatusLocked {
+			return ErrInvalidState
+		}
+		if e.now() <= c.TimeoutAt {
+			return nil // РµС‰С‘ РЅРµ РёСЃС‚С‘Рє вЂ” cron-friendly
+		}
+		return e.refundLocked(c, "timelock expired (forced)")
+	})
+}
+
+// ---------- Р§С‚РµРЅРёРµ ----------
+
+// GetEscrow РІРѕР·РІСЂР°С‰Р°РµС‚ РЅРµР·Р°РІРёСЃРёРјСѓСЋ РєРѕРїРёСЋ РєРѕРЅС‚СЂР°РєС‚Р° РїРѕ DealID.
+func (e *SmartContractEngine) GetEscrow(dealID string) (*EscrowContract, error) {
+	return e.ledger.GetEscrow(dealID)
+}
+
+
+// ============================================
+// FILE: escrow_test.go
+// ============================================
+package engine
+
+import (
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/bi-zone/ruwireguard-go/crypto/gost/gost3410"
+
+	"nis-core/internal/crypto"
+)
+
+// testClock вЂ” СѓРїСЂР°РІР»СЏРµРјС‹Рµ С‡Р°СЃС‹ РґР»СЏ С‚РµСЃС‚РѕРІ С‚Р°Р№Рј-Р»РѕРєР°.
+type testClock struct {
+	mu  sync.Mutex
+	now int64
+}
+
+func (c *testClock) Now() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *testClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now += int64(d.Seconds())
+}
+
+// testEnv вЂ” РєРѕРЅС„РёРіСѓСЂР°С†РёСЏ С‚РµСЃС‚РѕРІРѕРіРѕ РѕРєСЂСѓР¶РµРЅРёСЏ.
+type testEnv struct {
+	engine     *SmartContractEngine
+	ledger     *MockLedger
+	g          *crypto.GOSTProvider
+	issuerPriv *gost3410.PrivateKey
+	issuerPub  *gost3410.PublicKey
+	oraclePriv *gost3410.PrivateKey
+	oraclePub  *gost3410.PublicKey
+	clock      *testClock
+}
+
+func newTestEnv(t *testing.T) *testEnv {
+	t.Helper()
+	g := crypto.NewGOSTProvider()
+
+	issuerPriv, issuerPub, err := g.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("issuer keypair: %v", err)
+	}
+	oraclePriv, oraclePub, err := g.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("oracle keypair: %v", err)
+	}
+
+	ledger := NewMockLedger()
+	eng, err := NewSmartContractEngine(ledger, g, issuerPub, oraclePub)
+	if err != nil {
+		t.Fatalf("NewSmartContractEngine: %v", err)
+	}
+
+	clock := &testClock{now: 1_700_000_000}
+	eng.SetClock(clock.Now)
+
+	return &testEnv{
+		engine:     eng,
+		ledger:     ledger,
+		g:          g,
+		issuerPriv: issuerPriv,
+		issuerPub:  issuerPub,
+		oraclePriv: oraclePriv,
+		oraclePub:  oraclePub,
+		clock:      clock,
+	}
+}
+
+// oracleSigFor РїРѕРјРѕРіР°РµС‚ С‚РµСЃС‚Р°Рј РїРѕРґРїРёСЃС‹РІР°С‚СЊ РєРѕР»Р±СЌРє РѕСЂР°РєСѓР»Р° РІ С‚РѕРј Р¶Рµ
+// С„РѕСЂРјР°С‚Рµ, С‡С‚Рѕ Рё production-РєРѕРґ.
+func (e *testEnv) oracleSigFor(t *testing.T, dealID, kadastr string, success bool) []byte {
+	t.Helper()
+	digest := e.g.OracleResponseDigest(dealID, kadastr, success)
+	sig, err := e.g.SignGOST3410(e.oraclePriv, digest)
+	if err != nil {
+		t.Fatalf("sign oracle: %v", err)
+	}
+	return sig
+}
+
+const (
+	testDealID   = "DEAL-2026-0001"
+	testINN      = "7701982341"
+	testKadastr  = "77:01:0001001:102"
+	testMilHash  = "mil-hash-001"
+	testAmount   = uint64(485_000_000)
+	lockDuration = 30 * 24 * time.Hour
+)
+
+// issueToken вЂ” СѓРґРѕР±РЅС‹Р№ С…РµР»РїРµСЂ: СЌРјРёС‚РёСЂСѓРµС‚ В«РїСЂР°РІРёР»СЊРЅС‹Р№В» С‚РѕРєРµРЅ.
+func (e *testEnv) issueToken(t *testing.T) *DigitalNISRubles {
+	t.Helper()
+	token, err := e.engine.IssueColoredRubles(
+		testAmount, testMilHash, testINN, testKadastr, e.issuerPriv,
+	)
+	if err != nil {
+		t.Fatalf("IssueColoredRubles: %v", err)
+	}
+	return token
+}
+
+// ---------- Happy path ----------
+
+func TestEngine_HappyPath(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.issueToken(t)
+
+	if token.Amount != testAmount {
+		t.Fatalf("amount = %d, want %d", token.Amount, testAmount)
+	}
+	if len(token.IssuerSignature) != crypto.GOST3410SignatureSize {
+		t.Fatalf("sig size = %d, want %d", len(token.IssuerSignature), crypto.GOST3410SignatureSize)
+	}
+
+	if err := env.engine.LockInEscrow(testDealID, token, lockDuration); err != nil {
+		t.Fatalf("LockInEscrow: %v", err)
+	}
+
+	c, err := env.engine.GetEscrow(testDealID)
+	if err != nil {
+		t.Fatalf("GetEscrow: %v", err)
+	}
+	if c.Status != StatusLocked {
+		t.Fatalf("status = %s, want %s", c.Status, StatusLocked)
+	}
+	if c.TimeoutAt != c.CreatedAt+int64(lockDuration.Seconds()) {
+		t.Fatalf("TimeoutAt = %d, want %d", c.TimeoutAt, c.CreatedAt+int64(lockDuration.Seconds()))
+	}
+
+	sig := env.oracleSigFor(t, testDealID, testKadastr, true)
+	if err := env.engine.ProcessRosreestrCallback(testDealID, testKadastr, true, sig); err != nil {
+		t.Fatalf("ProcessRosreestrCallback: %v", err)
+	}
+
+	c, _ = env.engine.GetEscrow(testDealID)
+	if c.Status != StatusReleased {
+		t.Fatalf("status = %s, want %s", c.Status, StatusReleased)
+	}
+	if c.SettlementTxID == "" {
+		t.Fatal("SettlementTxID is empty")
+	}
+	if len(c.RosreestrProof) != crypto.GOST3410SignatureSize {
+		t.Fatalf("RosreestrProof size = %d", len(c.RosreestrProof))
+	}
+}
+
+func TestEngine_RosreestrRejects(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.issueToken(t)
+	if err := env.engine.LockInEscrow(testDealID, token, lockDuration); err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+
+	sig := env.oracleSigFor(t, testDealID, testKadastr, false)
+	if err := env.engine.ProcessRosreestrCallback(testDealID, testKadastr, false, sig); err != nil {
+		t.Fatalf("ProcessRosreestrCallback: %v", err)
+	}
+
+	c, _ := env.engine.GetEscrow(testDealID)
+	if c.Status != StatusRefunded {
+		t.Fatalf("status = %s, want %s", c.Status, StatusRefunded)
+	}
+	if c.RefundReason == "" {
+		t.Fatal("RefundReason is empty")
+	}
+	if c.SettlementTxID != "" {
+		t.Fatal("SettlementTxID should be empty on refund")
+	}
+}
+
+// ---------- РђС‚Р°РєРё Рё Р·Р°С‰РёС‚Р° ----------
+
+func TestEngine_TokenMisuse_WrongColorTag(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.issueToken(t)
+
+	// РђС‚Р°РєР°: РїРѕРґРјРµРЅСЏРµРј color tag РїРѕСЃР»Рµ РїРѕРґРїРёСЃРё.
+	token.TargetColorTag = "deadbeef" + token.TargetColorTag[8:]
+
+	err := env.engine.LockInEscrow(testDealID, token, lockDuration)
+	if !errors.Is(err, ErrTokenMisuse) {
+		t.Fatalf("err = %v, want ErrTokenMisuse", err)
+	}
+}
+
+func TestEngine_TokenMisuse_WrongBeneficiary(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.issueToken(t)
+
+	// РђС‚Р°РєР°: РїРѕРґРјРµРЅСЏРµРј РРќРќ Р·Р°СЃС‚СЂРѕР№С‰РёРєР° (СЌС‚Рѕ РјРµРЅСЏРµС‚ РѕР¶РёРґР°РµРјС‹Р№ color tag).
+	token.BeneficiaryINN = "9999999999"
+
+	err := env.engine.LockInEscrow(testDealID, token, lockDuration)
+	if !errors.Is(err, ErrTokenMisuse) {
+		t.Fatalf("err = %v, want ErrTokenMisuse", err)
+	}
+}
+
+func TestEngine_IssuerSigTampered(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.issueToken(t)
+
+	// РђС‚Р°РєР°: РїРѕРґРґРµР»С‹РІР°РµРј Р±Р°Р№С‚ РїРѕРґРїРёСЃРё СЌРјРёС‚РµРЅС‚Р°.
+	token.IssuerSignature[0] ^= 0x01
+
+	err := env.engine.LockInEscrow(testDealID, token, lockDuration)
+	if !errors.Is(err, ErrIssuerSigInvalid) {
+		t.Fatalf("err = %v, want ErrIssuerSigInvalid", err)
+	}
+}
+
+func TestEngine_OracleSigTampered(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.issueToken(t)
+	if err := env.engine.LockInEscrow(testDealID, token, lockDuration); err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+
+	sig := env.oracleSigFor(t, testDealID, testKadastr, true)
+	sig[0] ^= 0x01
+
+	err := env.engine.ProcessRosreestrCallback(testDealID, testKadastr, true, sig)
+	if !errors.Is(err, ErrOracleSigInvalid) {
+		t.Fatalf("err = %v, want ErrOracleSigInvalid", err)
+	}
+
+	// РЎРѕСЃС‚РѕСЏРЅРёРµ РЅРµ РґРѕР»Р¶РЅРѕ РёР·РјРµРЅРёС‚СЊСЃСЏ.
+	c, _ := env.engine.GetEscrow(testDealID)
+	if c.Status != StatusLocked {
+		t.Fatalf("status changed on failed callback: %s", c.Status)
+	}
+}
+
+func TestEngine_WrongKadastrInCallback(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.issueToken(t)
+	if err := env.engine.LockInEscrow(testDealID, token, lockDuration); err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+
+	// РџРѕРґРїРёСЃС‹РІР°РµРј РєРѕСЂСЂРµРєС‚РЅС‹Рј РєР»СЋС‡РѕРј, РЅРѕ СЃ РґСЂСѓРіРёРј РєР°РґР°СЃС‚СЂРѕРј.
+	sig := env.oracleSigFor(t, testDealID, "77:01:9999999:999", true)
+
+	err := env.engine.ProcessRosreestrCallback(testDealID, "77:01:9999999:999", true, sig)
+	if !errors.Is(err, ErrTokenMisuse) {
+		t.Fatalf("err = %v, want ErrTokenMisuse", err)
+	}
+}
+
+// ---------- РўР°Р№Рј-Р»РѕРє ----------
+
+func TestEngine_TimelockExpired_OnCallback(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.issueToken(t)
+	if err := env.engine.LockInEscrow(testDealID, token, lockDuration); err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+
+	// РЎРґРІРёРіР°РµРј РІСЂРµРјСЏ Р·Р° РїСЂРµРґРµР»С‹ С‚Р°Р№Рј-Р»РѕРєР°.
+	env.clock.Advance(31 * 24 * time.Hour)
+
+	sig := env.oracleSigFor(t, testDealID, testKadastr, true)
+	err := env.engine.ProcessRosreestrCallback(testDealID, testKadastr, true, sig)
+	if !errors.Is(err, ErrContractExpired) {
+		t.Fatalf("err = %v, want ErrContractExpired", err)
+	}
+
+	c, _ := env.engine.GetEscrow(testDealID)
+	if c.Status != StatusRefunded {
+		t.Fatalf("status = %s, want %s (refund must persist!)", c.Status, StatusRefunded)
+	}
+}
+
+func TestEngine_RefundExpired_NotYetExpired(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.issueToken(t)
+	if err := env.engine.LockInEscrow(testDealID, token, lockDuration); err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+
+	// Р’С‹Р·С‹РІР°РµРј RefundExpired РґРѕ РёСЃС‚РµС‡РµРЅРёСЏ С‚Р°Р№Рј-Р»РѕРєР°.
+	if err := env.engine.RefundExpired(testDealID); err != nil {
+		t.Fatalf("RefundExpired: %v", err)
+	}
+
+	c, _ := env.engine.GetEscrow(testDealID)
+	if c.Status != StatusLocked {
+		t.Fatalf("status = %s, want %s", c.Status, StatusLocked)
+	}
+}
+
+func TestEngine_RefundExpired_AfterTimeout(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.issueToken(t)
+	if err := env.engine.LockInEscrow(testDealID, token, lockDuration); err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+
+	env.clock.Advance(31 * 24 * time.Hour)
+
+	if err := env.engine.RefundExpired(testDealID); err != nil {
+		t.Fatalf("RefundExpired: %v", err)
+	}
+
+	c, _ := env.engine.GetEscrow(testDealID)
+	if c.Status != StatusRefunded {
+		t.Fatalf("status = %s, want %s", c.Status, StatusRefunded)
+	}
+}
+
+func TestEngine_RefundExpired_Idempotent(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.issueToken(t)
+	if err := env.engine.LockInEscrow(testDealID, token, lockDuration); err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+	env.clock.Advance(31 * 24 * time.Hour)
+
+	// РџРµСЂРІС‹Р№ РІС‹Р·РѕРІ вЂ” РґРµР»Р°РµС‚ СЂРµС„Р°РЅРґ.
+	if err := env.engine.RefundExpired(testDealID); err != nil {
+		t.Fatalf("first RefundExpired: %v", err)
+	}
+	// Р’С‚РѕСЂРѕР№ вЂ” РґРѕР»Р¶РµРЅ Р±С‹С‚СЊ no-op.
+	if err := env.engine.RefundExpired(testDealID); err != nil {
+		t.Fatalf("second RefundExpired: %v", err)
+	}
+
+	c, _ := env.engine.GetEscrow(testDealID)
+	if c.Status != StatusRefunded {
+		t.Fatalf("status = %s, want %s", c.Status, StatusRefunded)
+	}
+}
+
+// ---------- РљРѕРЅС„Р»РёРєС‚С‹ Рё РІР°Р»РёРґР°С†РёСЏ ----------
+
+func TestEngine_Conflict_DoubleLock(t *testing.T) {
+	env := newTestEnv(t)
+	token1 := env.issueToken(t)
+	token2 := env.issueToken(t)
+
+	if err := env.engine.LockInEscrow(testDealID, token1, lockDuration); err != nil {
+		t.Fatalf("first Lock: %v", err)
+	}
+
+	err := env.engine.LockInEscrow(testDealID, token2, lockDuration)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("err = %v, want ErrConflict", err)
+	}
+}
+
+func TestEngine_ProcessCallback_NotLocked(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.issueToken(t)
+	if err := env.engine.LockInEscrow(testDealID, token, lockDuration); err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+	sig := env.oracleSigFor(t, testDealID, testKadastr, true)
+	if err := env.engine.ProcessRosreestrCallback(testDealID, testKadastr, true, sig); err != nil {
+		t.Fatalf("first callback: %v", err)
+	}
+
+	// РџРѕРІС‚РѕСЂРЅС‹Р№ РєРѕР»Р±СЌРє РїРѕ СѓР¶Рµ Р·Р°РІРµСЂС€С‘РЅРЅРѕР№ СЃРґРµР»РєРµ.
+	err := env.engine.ProcessRosreestrCallback(testDealID, testKadastr, true, sig)
+	if !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("err = %v, want ErrInvalidState", err)
+	}
+}
+
+func TestEngine_Issue_Validation(t *testing.T) {
+	env := newTestEnv(t)
+
+	cases := []struct {
+		name   string
+		mutate func() (uint64, string, string, string)
+	}{
+		{"zero amount", func() (uint64, string, string, string) {
+			return 0, testMilHash, testINN, testKadastr
+		}},
+		{"empty militaryHash", func() (uint64, string, string, string) {
+			return testAmount, "", testINN, testKadastr
+		}},
+		{"empty INN", func() (uint64, string, string, string) {
+			return testAmount, testMilHash, "", testKadastr
+		}},
+		{"empty kadastr", func() (uint64, string, string, string) {
+			return testAmount, testMilHash, testINN, ""
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			a, h, i, k := c.mutate()
+			_, err := env.engine.IssueColoredRubles(a, h, i, k, env.issuerPriv)
+			if !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("err = %v, want ErrInvalidArgument", err)
+			}
+		})
+	}
+}
+
+func TestEngine_Issue_NilKey(t *testing.T) {
+	env := newTestEnv(t)
+	_, err := env.engine.IssueColoredRubles(testAmount, testMilHash, testINN, testKadastr, nil)
+	if !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("err = %v, want ErrInvalidArgument", err)
+	}
+}
+
+func TestEngine_New_Validation(t *testing.T) {
+	g := crypto.NewGOSTProvider()
+	_, pub, _ := g.GenerateKeyPair()
+	ledger := NewMockLedger()
+
+	if _, err := NewSmartContractEngine(nil, g, pub, pub); err == nil {
+		t.Fatal("expected error for nil ledger")
+	}
+	if _, err := NewSmartContractEngine(ledger, nil, pub, pub); err == nil {
+		t.Fatal("expected error for nil crypto")
+	}
+	if _, err := NewSmartContractEngine(ledger, g, nil, pub); err == nil {
+		t.Fatal("expected error for nil issuer key")
+	}
+	if _, err := NewSmartContractEngine(ledger, g, pub, nil); err == nil {
+		t.Fatal("expected error for nil oracle key")
+	}
+}
+
+func TestEngine_GetEscrow_NotFound(t *testing.T) {
+	env := newTestEnv(t)
+	_, err := env.engine.GetEscrow("nonexistent-deal")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+
+// ============================================
+// FILE: ledger.go
+// ============================================
+package engine
+
+import "errors"
+
+// РћС€РёР±РєРё, РІРѕР·РІСЂР°С‰Р°РµРјС‹Рµ СЂРµР°Р»РёР·Р°С†РёСЏРјРё Ledger.
+var (
+	// ErrNotFound вЂ” РєРѕРЅС‚СЂР°РєС‚ РїРѕ DealID РѕС‚СЃСѓС‚СЃС‚РІСѓРµС‚ РІ СЂРµРµСЃС‚СЂРµ.
+	ErrNotFound = errors.New("engine: escrow contract not found")
+
+	// ErrConflict вЂ” РїРѕРїС‹С‚РєР° СЃРѕР·РґР°С‚СЊ РєРѕРЅС‚СЂР°РєС‚ СЃ СѓР¶Рµ Р·Р°РЅСЏС‚С‹Рј DealID.
+	ErrConflict = errors.New("engine: escrow contract already exists")
+)
+
+// Ledger вЂ” Р°Р±СЃС‚СЂР°РєС†РёСЏ РЅР°Рґ С…СЂР°РЅРёР»РёС‰РµРј СЃРѕСЃС‚РѕСЏРЅРёСЏ СЂРµРµСЃС‚СЂР° СЌСЃРєСЂРѕСѓ-РєРѕРЅС‚СЂР°РєС‚РѕРІ.
+//
+// РРЅС‚РµСЂС„РµР№СЃ РѕР±СЉСЏРІР»РµРЅ РїРѕ РїСЂРёРЅС†РёРїСѓ consumer-defined interface:
+// РµРіРѕ РѕРїСЂРµРґРµР»СЏРµС‚ РїРѕС‚СЂРµР±РёС‚РµР»СЊ (РґРІРёР¶РѕРє escrow), Р° РЅРµ СЂРµР°Р»РёР·Р°С†РёСЏ
+// (BadgerDB, Hyperledger Fabric). Р­С‚Рѕ СЂР°Р·СЂС‹РІР°РµС‚ С†РёРєР»РёС‡РµСЃРєСѓСЋ Р·Р°РІРёСЃРёРјРѕСЃС‚СЊ:
+//
+//	engine  в†ђ  ledger  в†ђ  cmd/nis-node
+//
+// Р РµР°Р»РёР·Р°С†РёРё:
+//   - internal/ledger.BadgerLedger вЂ” РїСЂРѕС‚РѕС‚РёРї/РїСЂРѕРј РЅР° BadgerDB;
+//   - internal/engine.MockLedger   вЂ” in-memory, РґР»СЏ СЋРЅРёС‚-С‚РµСЃС‚РѕРІ РґРІРёР¶РєР°.
+type Ledger interface {
+	// PutEscrow Р°С‚РѕРјР°СЂРЅРѕ СЃРѕС…СЂР°РЅСЏРµС‚ РєРѕРЅС‚СЂР°РєС‚.
+	// Р’РѕР·РІСЂР°С‰Р°РµС‚ ErrConflict, РµСЃР»Рё DealID СѓР¶Рµ Р·Р°РЅСЏС‚.
+	PutEscrow(dealID string, contract *EscrowContract) error
+
+	// GetEscrow РІРѕР·РІСЂР°С‰Р°РµС‚ РєРѕРЅС‚СЂР°РєС‚ РїРѕ DealID.
+	// Р’РѕР·РІСЂР°С‰Р°РµС‚ ErrNotFound, РµСЃР»Рё РєРѕРЅС‚СЂР°РєС‚Р° РЅРµС‚.
+	GetEscrow(dealID string) (*EscrowContract, error)
+
+	// UpdateEscrow Р°С‚РѕРјР°СЂРЅРѕ РїСЂРёРјРµРЅСЏРµС‚ fn Рє РєРѕРЅС‚СЂР°РєС‚Сѓ.
+	// Р•СЃР»Рё fn РІРѕР·РІСЂР°С‰Р°РµС‚ РѕС€РёР±РєСѓ вЂ” РёР·РјРµРЅРµРЅРёСЏ РЅРµ СЃРѕС…СЂР°РЅСЏСЋС‚СЃСЏ.
+	// Р’РѕР·РІСЂР°С‰Р°РµС‚ ErrNotFound, РµСЃР»Рё РєРѕРЅС‚СЂР°РєС‚Р° РЅРµС‚.
+	UpdateEscrow(dealID string, fn func(*EscrowContract) error) error
+
+	// Close РѕСЃРІРѕР±РѕР¶РґР°РµС‚ СЂРµСЃСѓСЂСЃС‹ С…СЂР°РЅРёР»РёС‰Р°.
+	Close() error
+}
+
+
+// ============================================
+// FILE: mock_ledger_test.go
+// ============================================
+package engine
+
+import (
+	"errors"
+	"sync"
+)
+
+// MockLedger вЂ” in-memory СЂРµР°Р»РёР·Р°С†РёСЏ Ledger РґР»СЏ СЋРЅРёС‚-С‚РµСЃС‚РѕРІ РґРІРёР¶РєР°.
+//
+// РЎРµРјР°РЅС‚РёРєР° РїСЂРёР±Р»РёР¶РµРЅР° Рє СЂРµР°Р»СЊРЅРѕР№ С‚СЂР°РЅР·Р°РєС†РёРѕРЅРЅРѕР№: UpdateEscrow
+// СЂР°Р±РѕС‚Р°РµС‚ РЅР° РєРѕРїРёРё РєРѕРЅС‚СЂР°РєС‚Р°, РёР·РјРµРЅРµРЅРёСЏ РїСЂРёРјРµРЅСЏСЋС‚СЃСЏ С‚РѕР»СЊРєРѕ РїСЂРё
+// СѓСЃРїРµС€РЅРѕРј РІРѕР·РІСЂР°С‚Рµ fn. Р•СЃР»Рё fn РІРµСЂРЅС‘С‚ РѕС€РёР±РєСѓ вЂ” СЃРѕСЃС‚РѕСЏРЅРёРµ РЅРµ РјРµРЅСЏРµС‚СЃСЏ.
+type MockLedger struct {
+	mu        sync.Mutex
+	contracts map[string]*EscrowContract
+}
+
+// NewMockLedger СЃРѕР·РґР°С‘С‚ РїСѓСЃС‚РѕР№ РјРѕРє-Р»РµРґР¶РµСЂ.
+func NewMockLedger() *MockLedger {
+	return &MockLedger{contracts: make(map[string]*EscrowContract)}
+}
+
+// PutEscrow СЃРѕС…СЂР°РЅСЏРµС‚ РєРѕРЅС‚СЂР°РєС‚, РµСЃР»Рё DealID РµС‰С‘ РЅРµ Р·Р°РЅСЏС‚.
+func (m *MockLedger) PutEscrow(dealID string, contract *EscrowContract) error {
+	if dealID == "" {
+		return errors.New("mock ledger: empty dealID")
+	}
+	if contract == nil {
+		return errors.New("mock ledger: nil contract")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.contracts[dealID]; exists {
+		return ErrConflict
+	}
+	m.contracts[dealID] = contract.Clone()
+	return nil
+}
+
+// GetEscrow РІРѕР·РІСЂР°С‰Р°РµС‚ РєРѕРїРёСЋ РєРѕРЅС‚СЂР°РєС‚Р° РїРѕ DealID.
+func (m *MockLedger) GetEscrow(dealID string) (*EscrowContract, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.contracts[dealID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return c.Clone(), nil
+}
+
+// UpdateEscrow РїСЂРёРјРµРЅСЏРµС‚ fn Рє РєРѕРїРёРё РєРѕРЅС‚СЂР°РєС‚Р°. РџСЂРё РѕС€РёР±РєРµ РІ fn
+// СЃРѕСЃС‚РѕСЏРЅРёРµ СЂРµРµСЃС‚СЂР° РЅРµ РјРµРЅСЏРµС‚СЃСЏ.
+func (m *MockLedger) UpdateEscrow(dealID string, fn func(*EscrowContract) error) error {
+	if fn == nil {
+		return errors.New("mock ledger: nil update function")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.contracts[dealID]
+	if !ok {
+		return ErrNotFound
+	}
+	work := c.Clone()
+	if err := fn(work); err != nil {
+		return err
+	}
+	m.contracts[dealID] = work
+	return nil
+}
+
+// Close вЂ” no-op РґР»СЏ РјРѕРє-СЂРµР°Р»РёР·Р°С†РёРё.
+func (m *MockLedger) Close() error {
+	return nil
+}
+
+
+// ============================================
+// FILE: types.go
+// ============================================
+// Package engine СЃРѕРґРµСЂР¶РёС‚ СЏРґСЂРѕ СЃРјР°СЂС‚-РєРѕРЅС‚СЂР°РєС‚РѕРІ В«Р¦РёС„СЂРѕРІРѕР№ РќРРЎВ»:
+// РґРµС‚РµСЂРјРёРЅРёСЂРѕРІР°РЅРЅСѓСЋ СЃС‚РµР№С‚-РјР°С€РёРЅСѓ СЌСЃРєСЂРѕСѓ-РґРµРїРѕРЅРёСЂРѕРІР°РЅРёСЏ С†РµР»РµРІС‹С…
+// С†РёС„СЂРѕРІС‹С… СЂСѓР±Р»РµР№, РїСЂРёРІСЏР·Р°РЅРЅС‹С… Рє СЃРґРµР»РєРµ РІ СЂР°РјРєР°С… РќРРЎ.
+package engine
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+)
+
+// EscrowStatus вЂ” СЃС‚Р°С‚СѓСЃ СЌСЃРєСЂРѕСѓ-РєРѕРЅС‚СЂР°РєС‚Р°.
+type EscrowStatus string
+
+const (
+	// StatusCreated вЂ” РєРѕРЅС‚СЂР°РєС‚ СЃРѕР·РґР°РЅ, РЅРѕ СЃСЂРµРґСЃС‚РІР° РµС‰С‘ РЅРµ Р·Р°Р±Р»РѕРєРёСЂРѕРІР°РЅС‹.
+	StatusCreated EscrowStatus = "CREATED"
+	// StatusLocked вЂ” С‚РѕРєРµРЅ Р·Р°Р±Р»РѕРєРёСЂРѕРІР°РЅ РІ СЌСЃРєСЂРѕСѓ, РѕР¶РёРґР°РЅРёРµ РѕС‚РІРµС‚Р° Р РѕСЃСЂРµРµСЃС‚СЂР°.
+	StatusLocked EscrowStatus = "LOCKED_IN_ESCROW"
+	// StatusReleased вЂ” РїСЂР°РІРѕ Р·Р°СЂРµРіРёСЃС‚СЂРёСЂРѕРІР°РЅРѕ, СЃСЂРµРґСЃС‚РІР° Р·Р°С‡РёСЃР»РµРЅС‹ Р·Р°СЃС‚СЂРѕР№С‰РёРєСѓ.
+	StatusReleased EscrowStatus = "RELEASED_TO_SELLER"
+	// StatusRefunded вЂ” С‚Р°Р№Рј-Р»РѕРє РёСЃС‚С‘Рє РёР»Рё СЂРµРіРёСЃС‚СЂР°С†РёСЏ РѕС‚РєР»РѕРЅРµРЅР°,
+	// СЃСЂРµРґСЃС‚РІР° РІРѕР·РІСЂР°С‰РµРЅС‹ СЌРјРёС‚РµРЅС‚Сѓ (Р РѕСЃРІРѕРµРЅРёРїРѕС‚РµРєР°).
+	StatusRefunded EscrowStatus = "REFUNDED_TO_MINOBORONA"
+)
+
+// IsValid РїСЂРѕРІРµСЂСЏРµС‚, С‡С‚Рѕ СЃС‚Р°С‚СѓСЃ РІС…РѕРґРёС‚ РІ РїРµСЂРµС‡РµРЅСЊ РґРѕРїСѓСЃС‚РёРјС‹С….
+func (s EscrowStatus) IsValid() bool {
+	switch s {
+	case StatusCreated, StatusLocked, StatusReleased, StatusRefunded:
+		return true
+	}
+	return false
+}
+
+// DigitalNISRubles вЂ” В«РѕРєСЂР°С€РµРЅРЅС‹Р№В» С†РёС„СЂРѕРІРѕР№ СЂСѓР±Р»СЊ РќРРЎ.
+//
+// Р’ РѕС‚Р»РёС‡РёРµ РѕС‚ РѕР±С‹С‡РЅРѕРіРѕ Р¦Р , С‚РѕРєРµРЅ РЅРµСЃС‘С‚ РІ СЃРµР±Рµ:
+//   - TargetColorTag вЂ” РєСЂРёРїС‚РѕРіСЂР°С„РёС‡РµСЃРєРёР№ РјР°СЂРєРµСЂ С†РµР»РµРІРѕРіРѕ РЅР°Р·РЅР°С‡РµРЅРёСЏ.
+//     РЎС‡РёС‚Р°РµС‚СЃСЏ РєР°Рє РЎС‚СЂРёР±РѕРі-256 РѕС‚ РєРѕРЅРєР°С‚РµРЅР°С†РёРё РРќРќ Р·Р°СЃС‚СЂРѕР№С‰РёРєР° Рё
+//     РєР°РґР°СЃС‚СЂРѕРІРѕРіРѕ РЅРѕРјРµСЂР° РѕР±СЉРµРєС‚Р°. Р—Р°РїСЂРµС‰Р°РµС‚ РІС‹РІРѕРґ СЃСЂРµРґСЃС‚РІ РІ Р»СЋР±С‹Рµ
+//     РєРѕРЅС‚СѓСЂС‹, РєСЂРѕРјРµ СѓРєР°Р·Р°РЅРЅРѕРіРѕ.
+//   - MilitaryIDHash вЂ” РѕР±РµР·Р»РёС‡РµРЅРЅС‹Р№ РёРґРµРЅС‚РёС„РёРєР°С‚РѕСЂ РІРѕРµРЅРЅРѕСЃР»СѓР¶Р°С‰РµРіРѕ
+//     (РЎС‚СЂРёР±РѕРі-256 РѕС‚ РІРЅСѓС‚СЂРµРЅРЅРµРіРѕ РёРґРµРЅС‚РёС„РёРєР°С‚РѕСЂР° РІ СЃРёСЃС‚РµРјРµ РњРћ).
+//     РџРѕР·РІРѕР»СЏРµС‚ Р°СѓРґРёС‚ Р±РµР· СЂР°СЃРєСЂС‹С‚РёСЏ РїРµСЂСЃРѕРЅР°Р»СЊРЅС‹С… РґР°РЅРЅС‹С….
+//   - IssuerSignature вЂ” РїРѕРґРїРёСЃСЊ СЌРјРёС‚РµРЅС‚Р° (Р РѕСЃРІРѕРµРЅРёРїРѕС‚РµРєР°) РїРѕ
+//     Р“РћРЎРў Р  34.10-2012. Р‘РµР· РЅРµС‘ С‚РѕРєРµРЅ РЅРµРґРµР№СЃС‚РІРёС‚РµР»РµРЅ.
+type DigitalNISRubles struct {
+	// TokenID вЂ” СѓРЅРёРєР°Р»СЊРЅС‹Р№ РёРґРµРЅС‚РёС„РёРєР°С‚РѕСЂ РІС‹РїСѓСЃРєР° (hex-РЎС‚СЂРёР±РѕРі-256).
+	TokenID string `json:"token_id"`
+
+	// Amount вЂ” РЅРѕРјРёРЅР°Р» РІ РјРёРЅРёРјР°Р»СЊРЅС‹С… РЅРµРґРµР»РёРјС‹С… РµРґРёРЅРёС†Р°С… (РєРѕРїРµР№РєРё).
+	Amount uint64 `json:"amount"`
+
+	// TargetColorTag вЂ” hex-РЎС‚СЂРёР±РѕРі-256 РѕС‚ (INN || KadastrNo).
+	TargetColorTag string `json:"target_color_tag"`
+
+	// MilitaryIDHash вЂ” hex-РЎС‚СЂРёР±РѕРі-256 РѕР±РµР·Р»РёС‡РµРЅРЅРѕРіРѕ РёРґРµРЅС‚РёС„РёРєР°С‚РѕСЂР°.
+	MilitaryIDHash string `json:"military_id_hash"`
+
+	// BeneficiaryINN вЂ” РРќРќ Р°РєРєСЂРµРґРёС‚РѕРІР°РЅРЅРѕРіРѕ Р·Р°СЃС‚СЂРѕР№С‰РёРєР° (РїРѕР»СѓС‡Р°С‚РµР»СЏ).
+	BeneficiaryINN string `json:"beneficiary_inn"`
+
+	// CadastralNumber вЂ” РєР°РґР°СЃС‚СЂРѕРІС‹Р№ РЅРѕРјРµСЂ РѕР±СЉРµРєС‚Р° РЅРµРґРІРёР¶РёРјРѕСЃС‚Рё.
+	CadastralNumber string `json:"cadastral_num"`
+
+	// IssuerSignature вЂ” РїРѕРґРїРёСЃСЊ СЌРјРёС‚РµРЅС‚Р° (Р“РћРЎРў Р  34.10-2012, 64 Р±Р°Р№С‚Р°).
+	IssuerSignature []byte `json:"issuer_signature"`
+
+	// IssuedAt вЂ” UNIX-РІСЂРµРјСЏ СЌРјРёСЃСЃРёРё С‚РѕРєРµРЅР°.
+	IssuedAt int64 `json:"issued_at"`
+}
+
+// EscrowContract вЂ” СЃРѕСЃС‚РѕСЏРЅРёРµ СЌСЃРєСЂРѕСѓ-СЃРѕРіР»Р°С€РµРЅРёСЏ РїРѕ РѕРґРЅРѕР№ СЃРґРµР»РєРµ РќРРЎ.
+//
+// РћРґРёРЅ РєРѕРЅС‚СЂР°РєС‚ вЂ” РѕРґРёРЅ С‚РѕРєРµРЅ вЂ” РѕРґРёРЅ РѕР±СЉРµРєС‚ РЅРµРґРІРёР¶РёРјРѕСЃС‚Рё.
+// Р–РёР·РЅРµРЅРЅС‹Р№ С†РёРєР»: Created в†’ Locked в†’ Released | Refunded.
+type EscrowContract struct {
+	// DealID вЂ” СѓРЅРёРєР°Р»СЊРЅС‹Р№ РёРґРµРЅС‚РёС„РёРєР°С‚РѕСЂ СЃРґРµР»РєРё РІ СЃРёСЃС‚РµРјРµ.
+	DealID string `json:"deal_id"`
+
+	// Token вЂ” СЌРјРёС‚РёСЂРѕРІР°РЅРЅС‹Р№ В«РѕРєСЂР°С€РµРЅРЅС‹Р№В» СЂСѓР±Р»СЊ, РїСЂРёРІСЏР·Р°РЅРЅС‹Р№ Рє СЃРґРµР»РєРµ.
+	Token DigitalNISRubles `json:"token"`
+
+	// Status вЂ” С‚РµРєСѓС‰РёР№ СЃС‚Р°С‚СѓСЃ РєРѕРЅС‚СЂР°РєС‚Р°.
+	Status EscrowStatus `json:"status"`
+
+	// CreatedAt вЂ” UNIX-РІСЂРµРјСЏ СЃРѕР·РґР°РЅРёСЏ РєРѕРЅС‚СЂР°РєС‚Р°.
+	CreatedAt int64 `json:"created_at"`
+
+	// UpdatedAt вЂ” UNIX-РІСЂРµРјСЏ РїРѕСЃР»РµРґРЅРµРіРѕ РёР·РјРµРЅРµРЅРёСЏ СЃРѕСЃС‚РѕСЏРЅРёСЏ.
+	UpdatedAt int64 `json:"updated_at"`
+
+	// TimeoutAt вЂ” UNIX-РІСЂРµРјСЏ СЃСЂР°Р±Р°С‚С‹РІР°РЅРёСЏ С‚Р°Р№Рј-Р»РѕРєР°.
+	// Р•СЃР»Рё Рє СЌС‚РѕРјСѓ РјРѕРјРµРЅС‚Сѓ РѕС‚РІРµС‚ Р РѕСЃСЂРµРµСЃС‚СЂР° РЅРµ РїРѕР»СѓС‡РµРЅ вЂ” СЃСЂРµРґСЃС‚РІР°
+	// Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРё РІРѕР·РІСЂР°С‰Р°СЋС‚СЃСЏ СЌРјРёС‚РµРЅС‚Сѓ.
+	TimeoutAt int64 `json:"timeout_at"`
+
+	// RosreestrProof вЂ” РїРѕРґРїРёСЃР°РЅРЅС‹Р№ РѕС‚РІРµС‚ РѕСЂР°РєСѓР»Р° Р•Р“Р Рќ
+	// (Р“РћРЎРў Р  34.10-2012, 64 Р±Р°Р№С‚Р°). nil РґРѕ РїРѕР»СѓС‡РµРЅРёСЏ РѕС‚РІРµС‚Р°.
+	RosreestrProof []byte `json:"rosreestr_proof,omitempty"`
+
+	// SettlementTxID вЂ” РёРґРµРЅС‚РёС„РёРєР°С‚РѕСЂ С‚СЂР°РЅР·Р°РєС†РёРё РїРµСЂРµРІРѕРґР° СЃСЂРµРґСЃС‚РІ
+	// Р·Р°СЃС‚СЂРѕР№С‰РёРєСѓ (hex-РЎС‚СЂРёР±РѕРі-256). Р—Р°РїРѕР»РЅСЏРµС‚СЃСЏ РїСЂРё StatusReleased.
+	SettlementTxID string `json:"settlement_tx_id,omitempty"`
+
+	// RefundReason вЂ” РїСЂРёС‡РёРЅР° РІРѕР·РІСЂР°С‚Р° СЃСЂРµРґСЃС‚РІ. Р—Р°РїРѕР»РЅСЏРµС‚СЃСЏ РїСЂРё StatusRefunded.
+	RefundReason string `json:"refund_reason,omitempty"`
+}
+
+// Serialize СЃРµСЂРёР°Р»РёР·СѓРµС‚ РєРѕРЅС‚СЂР°РєС‚ РІ JSON РґР»СЏ С…СЂР°РЅРµРЅРёСЏ РІ BadgerDB.
+func (c *EscrowContract) Serialize() ([]byte, error) {
+	if c == nil {
+		return nil, errors.New("engine: cannot serialize nil contract")
+	}
+	return json.Marshal(c)
+}
+
+// DeserializeEscrow РґРµСЃРµСЂРёР°Р»РёР·СѓРµС‚ РєРѕРЅС‚СЂР°РєС‚ РёР· JSON.
+func DeserializeEscrow(data []byte) (*EscrowContract, error) {
+	if len(data) == 0 {
+		return nil, errors.New("engine: cannot deserialize empty data")
+	}
+	var c EscrowContract
+	if err := json.Unmarshal(data, &c); err != nil {
+		return nil, fmt.Errorf("engine: deserialize escrow: %w", err)
+	}
+	return &c, nil
+}
+
+// Validate РїСЂРѕРІРµСЂСЏРµС‚ Р±Р°Р·РѕРІСѓСЋ РєРѕСЂСЂРµРєС‚РЅРѕСЃС‚СЊ СЃС‚СЂСѓРєС‚СѓСЂС‹ РєРѕРЅС‚СЂР°РєС‚Р°
+// (Р±РµР· РєСЂРёРїС‚РѕРіСЂР°С„РёС‡РµСЃРєРёС… РїСЂРѕРІРµСЂРѕРє вЂ” РѕРЅРё РІ escrow_engine.go).
+func (c *EscrowContract) Validate() error {
+	if c == nil {
+		return errors.New("engine: nil contract")
+	}
+	if c.DealID == "" {
+		return errors.New("engine: empty DealID")
+	}
+	if !c.Status.IsValid() {
+		return fmt.Errorf("engine: invalid status %q", c.Status)
+	}
+	if c.CreatedAt <= 0 {
+		return errors.New("engine: CreatedAt must be positive")
+	}
+	if c.TimeoutAt <= c.CreatedAt {
+		return errors.New("engine: TimeoutAt must be after CreatedAt")
+	}
+	if err := c.Token.Validate(); err != nil {
+		return fmt.Errorf("engine: invalid token: %w", err)
+	}
+	return nil
+}
+
+// Validate РїСЂРѕРІРµСЂСЏРµС‚ Р±Р°Р·РѕРІСѓСЋ РєРѕСЂСЂРµРєС‚РЅРѕСЃС‚СЊ С‚РѕРєРµРЅР°.
+func (t *DigitalNISRubles) Validate() error {
+	if t == nil {
+		return errors.New("engine: nil token")
+	}
+	if t.TokenID == "" {
+		return errors.New("engine: empty TokenID")
+	}
+	if t.Amount == 0 {
+		return errors.New("engine: amount must be positive")
+	}
+	if t.TargetColorTag == "" {
+		return errors.New("engine: empty TargetColorTag")
+	}
+	if t.BeneficiaryINN == "" {
+		return errors.New("engine: empty BeneficiaryINN")
+	}
+	if t.CadastralNumber == "" {
+		return errors.New("engine: empty CadastralNumber")
+	}
+	if len(t.IssuerSignature) == 0 {
+		return errors.New("engine: missing IssuerSignature")
+	}
+	return nil
+}
+
+// Clone РІРѕР·РІСЂР°С‰Р°РµС‚ РіР»СѓР±РѕРєСѓСЋ РєРѕРїРёСЋ РєРѕРЅС‚СЂР°РєС‚Р°.
+// РќСѓР¶РЅР°, С‡С‚РѕР±С‹ РёР·Р±РµР¶Р°С‚СЊ Р°Р»РёР°СЃРёРЅРіР° РїСЂРё СЃРѕС…СЂР°РЅРµРЅРёРё РІ Р‘Р” Рё РІРѕР·РІСЂР°С‚Рµ РЅР°СЂСѓР¶Сѓ.
+func (c *EscrowContract) Clone() *EscrowContract {
+	if c == nil {
+		return nil
+	}
+	cp := *c
+	if c.Token.IssuerSignature != nil {
+		cp.Token.IssuerSignature = append([]byte(nil), c.Token.IssuerSignature...)
+	}
+	if c.RosreestrProof != nil {
+		cp.RosreestrProof = append([]byte(nil), c.RosreestrProof...)
+	}
+	return &cp
+}
+
+
+// ============================================
+// FILE: types_test.go
+// ============================================
+package engine
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+)
+
+func sampleToken() DigitalNISRubles {
+	return DigitalNISRubles{
+		TokenID:         strings.Repeat("a", 64),
+		Amount:          485_000_000, // 4 850 000.00 в‚Ѕ РІ РєРѕРїРµР№РєР°С…
+		TargetColorTag:  strings.Repeat("b", 64),
+		MilitaryIDHash:  strings.Repeat("c", 64),
+		BeneficiaryINN:  "7701982341",
+		CadastralNumber: "77:01:0001001:102",
+		IssuerSignature: bytes.Repeat([]byte{0xAB}, 64),
+		IssuedAt:        1_700_000_000,
+	}
+}
+
+func sampleContract() *EscrowContract {
+	return &EscrowContract{
+		DealID:    "DEAL-2026-0001",
+		Token:     sampleToken(),
+		Status:    StatusLocked,
+		CreatedAt: 1_700_000_000,
+		UpdatedAt: 1_700_000_000,
+		TimeoutAt: 1_700_000_000 + 30*24*3600,
+	}
+}
+
+func TestEscrowStatus_IsValid(t *testing.T) {
+	for _, s := range []EscrowStatus{
+		StatusCreated, StatusLocked, StatusReleased, StatusRefunded,
+	} {
+		if !s.IsValid() {
+			t.Fatalf("%q should be valid", s)
+		}
+	}
+	if EscrowStatus("BOGUS").IsValid() {
+		t.Fatal("bogus status accepted")
+	}
+	if EscrowStatus("").IsValid() {
+		t.Fatal("empty status accepted")
+	}
+}
+
+func TestDigitalNISRubles_Validate_OK(t *testing.T) {
+	tok := sampleToken()
+	if err := tok.Validate(); err != nil {
+		t.Fatalf("valid token rejected: %v", err)
+	}
+}
+
+func TestDigitalNISRubles_Validate_MissingFields(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*DigitalNISRubles)
+	}{
+		{"no TokenID", func(x *DigitalNISRubles) { x.TokenID = "" }},
+		{"no Amount", func(x *DigitalNISRubles) { x.Amount = 0 }},
+		{"no ColorTag", func(x *DigitalNISRubles) { x.TargetColorTag = "" }},
+		{"no INN", func(x *DigitalNISRubles) { x.BeneficiaryINN = "" }},
+		{"no Kadastr", func(x *DigitalNISRubles) { x.CadastralNumber = "" }},
+		{"no Signature", func(x *DigitalNISRubles) { x.IssuerSignature = nil }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tok := sampleToken()
+			c.mutate(&tok)
+			if err := tok.Validate(); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
+func TestEscrowContract_Validate_OK(t *testing.T) {
+	c := sampleContract()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("valid contract rejected: %v", err)
+	}
+}
+
+func TestEscrowContract_Validate_TimeoutBeforeCreated(t *testing.T) {
+	c := sampleContract()
+	c.TimeoutAt = c.CreatedAt - 1
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for TimeoutAt <= CreatedAt")
+	}
+}
+
+func TestEscrowContract_Serialize_Roundtrip(t *testing.T) {
+	orig := sampleContract()
+	data, err := orig.Serialize()
+	if err != nil {
+		t.Fatalf("Serialize: %v", err)
+	}
+	restored, err := DeserializeEscrow(data)
+	if err != nil {
+		t.Fatalf("DeserializeEscrow: %v", err)
+	}
+	if restored.DealID != orig.DealID {
+		t.Fatalf("DealID mismatch: got %q, want %q", restored.DealID, orig.DealID)
+	}
+	if restored.Token.Amount != orig.Token.Amount {
+		t.Fatalf("Amount mismatch")
+	}
+	if !bytes.Equal(restored.Token.IssuerSignature, orig.Token.IssuerSignature) {
+		t.Fatal("IssuerSignature mismatch after roundtrip")
+	}
+	if restored.Status != orig.Status {
+		t.Fatalf("Status mismatch")
+	}
+}
+
+func TestDeserializeEscrow_Empty(t *testing.T) {
+	if _, err := DeserializeEscrow(nil); err == nil {
+		t.Fatal("expected error for nil input")
+	}
+	if _, err := DeserializeEscrow([]byte{}); err == nil {
+		t.Fatal("expected error for empty input")
+	}
+}
+
+func TestDeserializeEscrow_MalformedJSON(t *testing.T) {
+	if _, err := DeserializeEscrow([]byte("{not json}")); err == nil {
+		t.Fatal("expected error for malformed JSON")
+	}
+}
+
+func TestEscrowContract_Clone_NoAliasing(t *testing.T) {
+	orig := sampleContract()
+	orig.RosreestrProof = []byte{1, 2, 3, 4}
+
+	cp := orig.Clone()
+
+	// РњРµРЅСЏРµРј Р±Р°Р№С‚С‹ РєР»РѕРЅР° вЂ” РѕСЂРёРіРёРЅР°Р» РЅРµ РґРѕР»Р¶РµРЅ РёР·РјРµРЅРёС‚СЊСЃСЏ.
+	cp.RosreestrProof[0] = 0xFF
+	cp.Token.IssuerSignature[0] = 0xFF
+
+	if orig.RosreestrProof[0] == 0xFF {
+		t.Fatal("clone aliases RosreestrProof")
+	}
+	if orig.Token.IssuerSignature[0] == 0xFF {
+		t.Fatal("clone aliases IssuerSignature")
+	}
+}
+
+func TestSerialize_NilContract(t *testing.T) {
+	var c *EscrowContract
+	if _, err := c.Serialize(); err == nil {
+		t.Fatal("expected error for nil contract")
+	}
+}
+
+
+// ============================================
+// FILE: badger.go
+// ============================================
+// Package ledger РїСЂРµРґРѕСЃС‚Р°РІР»СЏРµС‚ СЂРµР°Р»РёР·Р°С†РёРё РёРЅС‚РµСЂС„РµР№СЃР° engine.Ledger.
+//
+// РќР°РїСЂР°РІР»РµРЅРёРµ Р·Р°РІРёСЃРёРјРѕСЃС‚РµР№: ledger РёРјРїРѕСЂС‚РёСЂСѓРµС‚ engine, РЅРѕ РќР• РЅР°РѕР±РѕСЂРѕС‚.
+// Р­С‚Рѕ РёСЃРєР»СЋС‡Р°РµС‚ С†РёРєР»РёС‡РµСЃРєРёР№ РёРјРїРѕСЂС‚ Рё РїРѕР·РІРѕР»СЏРµС‚ РґРІРёР¶РєСѓ СЂР°Р±РѕС‚Р°С‚СЊ СЃ
+// Р»СЋР±РѕР№ СЂРµР°Р»РёР·Р°С†РёРµР№ С…СЂР°РЅРёР»РёС‰Р° вЂ” BadgerDB, Hyperledger Fabric РёР»Рё
+// in-memory MockLedger РёР· С‚РµСЃС‚РѕРІ.
+package ledger
+
+import (
+	"errors"
+	"fmt"
+
+	badger "github.com/dgraph-io/badger/v4"
+
+	"nis-core/internal/engine"
+)
+
+// EscrowKeyPrefix вЂ” РїСЂРµС„РёРєСЃ РєР»СЋС‡РµР№ СЌСЃРєСЂРѕСѓ-РєРѕРЅС‚СЂР°РєС‚РѕРІ РІ BadgerDB.
+// Р­РєСЃРїРѕСЂС‚РёСЂСѓРµС‚СЃСЏ РґР»СЏ CLI-СѓС‚РёР»РёС‚ (Р°СѓРґРёС‚РѕСЂ), РєРѕС‚РѕСЂС‹Рµ С‡РёС‚Р°СЋС‚ Р‘Р”
+// РЅР°РїСЂСЏРјСѓСЋ, РјРёРЅСѓСЏ РёРЅС‚РµСЂС„РµР№СЃ Ledger.
+const EscrowKeyPrefix = "escrow:"
+
+// BadgerLedger вЂ” СЂРµР°Р»РёР·Р°С†РёСЏ engine.Ledger РЅР° embedded key-value
+// С…СЂР°РЅРёР»РёС‰Рµ BadgerDB (LSM-tree, С‡РёСЃС‚С‹Р№ Go, Р±РµР· CGO).
+//
+// Р“Р°СЂР°РЅС‚РёСЂСѓРµС‚ Р°С‚РѕРјР°СЂРЅРѕСЃС‚СЊ РѕРїРµСЂР°С†РёР№ С‡С‚РµРЅРёСЏ-РјРѕРґРёС„РёРєР°С†РёРё-Р·Р°РїРёСЃРё:
+// РєР°Р¶РґС‹Р№ РІС‹Р·РѕРІ UpdateEscrow РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ РІ РѕРґРЅРѕР№ С‚СЂР°РЅР·Р°РєС†РёРё BadgerDB.
+type BadgerLedger struct {
+	db *badger.DB
+}
+
+// compile-time РїСЂРѕРІРµСЂРєР°, С‡С‚Рѕ BadgerLedger СЂРµР°Р»РёР·СѓРµС‚ engine.Ledger.
+var _ engine.Ledger = (*BadgerLedger)(nil)
+
+// NewBadgerLedger РѕС‚РєСЂС‹РІР°РµС‚ (РёР»Рё СЃРѕР·РґР°С‘С‚) С…СЂР°РЅРёР»РёС‰Рµ РїРѕ СѓРєР°Р·Р°РЅРЅРѕРјСѓ РїСѓС‚Рё.
+// Р›РѕРіРё BadgerDB РѕС‚РєР»СЋС‡РµРЅС‹ вЂ” РѕРЅРё С€СѓРјРЅС‹Рµ Рё РІ С‚РµСЃС‚Р°С… РјРµС€Р°СЋС‚ С‡РёС‚Р°С‚СЊ РІС‹РІРѕРґ.
+func NewBadgerLedger(path string) (*BadgerLedger, error) {
+	if path == "" {
+		return nil, errors.New("ledger: empty db path")
+	}
+	opts := badger.DefaultOptions(path).
+		WithLogger(nil).
+		WithLoggingLevel(badger.ERROR).
+		// Badger РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ СЃРѕР·РґР°С‘С‚ vlog-С„Р°Р№Р»С‹ РїРѕ 1вЂ“2 Р“Р‘.
+		// Р”Р»СЏ РїСЂРѕС‚РѕС‚РёРїР° 64 РњР‘ С…РІР°С‚Р°РµС‚ СЃ Р±РѕР»СЊС€РёРј Р·Р°РїР°СЃРѕРј.
+		WithValueLogFileSize(64 << 20)
+	db, err := badger.Open(opts)
+	if err != nil {
+		return nil, fmt.Errorf("ledger: open badger at %q: %w", path, err)
+	}
+	return &BadgerLedger{db: db}, nil
+}
+
+// Close Р·Р°РєСЂС‹РІР°РµС‚ Р‘Р”. РРґРµРјРїРѕС‚РµРЅС‚РµРЅ: РїРѕРІС‚РѕСЂРЅС‹Р№ РІС‹Р·РѕРІ РІРµСЂРЅС‘С‚ РѕС€РёР±РєСѓ
+// С‚РѕР»СЊРєРѕ РµСЃР»Рё Р‘Р” СѓР¶Рµ Р·Р°РєСЂС‹С‚Р° вЂ” Badger СЃР°Рј РµС‘ РґРµС‚РµРєС‚РёСЂСѓРµС‚.
+func (l *BadgerLedger) Close() error {
+	if l == nil || l.db == nil {
+		return nil
+	}
+	return l.db.Close()
+}
+
+// escrowKey С„РѕСЂРјРёСЂСѓРµС‚ РєР»СЋС‡ РґР»СЏ DealID.
+func escrowKey(dealID string) []byte {
+	return []byte(EscrowKeyPrefix + dealID)
+}
+
+// PutEscrow Р°С‚РѕРјР°СЂРЅРѕ СЃРѕС…СЂР°РЅСЏРµС‚ РєРѕРЅС‚СЂР°РєС‚. Р•СЃР»Рё DealID Р·Р°РЅСЏС‚ вЂ” ErrConflict.
+func (l *BadgerLedger) PutEscrow(dealID string, contract *engine.EscrowContract) error {
+	if dealID == "" {
+		return errors.New("ledger: empty dealID")
+	}
+	if contract == nil {
+		return errors.New("ledger: nil contract")
+	}
+	payload, err := contract.Serialize()
+	if err != nil {
+		return fmt.Errorf("ledger: serialize contract: %w", err)
+	}
+	key := escrowKey(dealID)
+
+	return l.db.Update(func(txn *badger.Txn) error {
+		// РџСЂРѕРІРµСЂСЏРµРј, С‡С‚Рѕ РєР»СЋС‡Р° РЅРµС‚.
+		_, err := txn.Get(key)
+		switch {
+		case err == nil:
+			return engine.ErrConflict
+		case errors.Is(err, badger.ErrKeyNotFound):
+			// РѕРє, РїСЂРѕРґРѕР»Р¶Р°РµРј
+		default:
+			return fmt.Errorf("ledger: check existence: %w", err)
+		}
+		if err := txn.Set(key, payload); err != nil {
+			return fmt.Errorf("ledger: set contract: %w", err)
+		}
+		return nil
+	})
+}
+
+// GetEscrow РІРѕР·РІСЂР°С‰Р°РµС‚ РЅРµР·Р°РІРёСЃРёРјСѓСЋ РєРѕРїРёСЋ РєРѕРЅС‚СЂР°РєС‚Р°.
+// Р•СЃР»Рё РєРѕРЅС‚СЂР°РєС‚ РЅРµ РЅР°Р№РґРµРЅ вЂ” engine.ErrNotFound.
+func (l *BadgerLedger) GetEscrow(dealID string) (*engine.EscrowContract, error) {
+	if dealID == "" {
+		return nil, errors.New("ledger: empty dealID")
+	}
+	key := escrowKey(dealID)
+
+	var payload []byte
+	err := l.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(key)
+		if err != nil {
+			return err
+		}
+		return item.Value(func(v []byte) error {
+			// РљРѕРїРёСЂСѓРµРј, С‡С‚РѕР±С‹ РЅРµ РґРµСЂР¶Р°С‚СЊ СЃСЃС‹Р»РєСѓ РЅР° РІРЅСѓС‚СЂРµРЅРЅРёР№ Р±СѓС„РµСЂ Badger.
+			payload = append([]byte(nil), v...)
+			return nil
+		})
+	})
+	if err != nil {
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nil, engine.ErrNotFound
+		}
+		return nil, fmt.Errorf("ledger: get escrow: %w", err)
+	}
+
+	contract, err := engine.DeserializeEscrow(payload)
+	if err != nil {
+		return nil, fmt.Errorf("ledger: deserialize escrow: %w", err)
+	}
+	return contract, nil
+}
+
+// UpdateEscrow Р°С‚РѕРјР°СЂРЅРѕ РїСЂРёРјРµРЅСЏРµС‚ fn Рє РєРѕРЅС‚СЂР°РєС‚Сѓ.
+//
+// РџРѕСЂСЏРґРѕРє РѕРїРµСЂР°С†РёР№ РІРЅСѓС‚СЂРё РѕРґРЅРѕР№ С‚СЂР°РЅР·Р°РєС†РёРё BadgerDB:
+//  1. Read вЂ” РїРѕР»СѓС‡РёС‚СЊ С‚РµРєСѓС‰РёР№ РєРѕРЅС‚СЂР°РєС‚.
+//  2. Modify вЂ” РїСЂРёРјРµРЅРёС‚СЊ fn.
+//  3. Write вЂ” СЃРѕС…СЂР°РЅРёС‚СЊ СЂРµР·СѓР»СЊС‚Р°С‚.
+//
+// Р•СЃР»Рё fn РІРѕР·РІСЂР°С‰Р°РµС‚ РѕС€РёР±РєСѓ вЂ” С‚xn РѕС‚РєР°С‚С‹РІР°РµС‚СЃСЏ, СЃРѕСЃС‚РѕСЏРЅРёРµ РІ Р‘Р”
+// РѕСЃС‚Р°С‘С‚СЃСЏ РїСЂРµР¶РЅРёРј. Р­С‚Рѕ РєР»СЋС‡РµРІР°СЏ РіР°СЂР°РЅС‚РёСЏ: Р±РёР·РЅРµСЃ-Р»РѕРіРёРєР° РЅРµ РјРѕР¶РµС‚
+// РѕСЃС‚Р°РІРёС‚СЊ СЂРµРµСЃС‚СЂ РІ В«РїРѕР»СѓРёР·РјРµРЅС‘РЅРЅРѕРјВ» СЃРѕСЃС‚РѕСЏРЅРёРё.
+func (l *BadgerLedger) UpdateEscrow(dealID string, fn func(*engine.EscrowContract) error) error {
+	if dealID == "" {
+		return errors.New("ledger: empty dealID")
+	}
+	if fn == nil {
+		return errors.New("ledger: nil update function")
+	}
+	key := escrowKey(dealID)
+
+	return l.db.Update(func(txn *badger.Txn) error {
+		// 1. Read.
+		item, err := txn.Get(key)
+		if err != nil {
+			if errors.Is(err, badger.ErrKeyNotFound) {
+				return engine.ErrNotFound
+			}
+			return fmt.Errorf("ledger: get for update: %w", err)
+		}
+
+		var payload []byte
+		if err := item.Value(func(v []byte) error {
+			payload = append([]byte(nil), v...)
+			return nil
+		}); err != nil {
+			return fmt.Errorf("ledger: read value: %w", err)
+		}
+
+		contract, err := engine.DeserializeEscrow(payload)
+		if err != nil {
+			return fmt.Errorf("ledger: deserialize: %w", err)
+		}
+
+		// 2. Modify.
+		if err := fn(contract); err != nil {
+			return err
+		}
+
+		// 3. Write.
+		updated, err := contract.Serialize()
+		if err != nil {
+			return fmt.Errorf("ledger: serialize after update: %w", err)
+		}
+		if err := txn.Set(key, updated); err != nil {
+			return fmt.Errorf("ledger: set after update: %w", err)
+		}
+		return nil
+	})
+}
+
+// IterateEscrows РІС‹Р·С‹РІР°РµС‚ fn РґР»СЏ РєР°Р¶РґРѕРіРѕ РєРѕРЅС‚СЂР°РєС‚Р° РІ Р‘Р”.
+//
+// РџРѕСЂСЏРґРѕРє РѕР±С…РѕРґР° РЅРµ РѕРїСЂРµРґРµР»С‘РЅ (Р·Р°РІРёСЃРёС‚ РѕС‚ РІРЅСѓС‚СЂРµРЅРЅРµРіРѕ СѓСЃС‚СЂРѕР№СЃС‚РІР°
+// BadgerDB). Р•СЃР»Рё РЅСѓР¶РЅР° РґРµС‚РµСЂРјРёРЅРёСЂРѕРІР°РЅРЅРѕСЃС‚СЊ вЂ” СЃРѕСЂС‚РёСЂСѓР№С‚Рµ РЅР° СЃС‚РѕСЂРѕРЅРµ
+// РІС‹Р·С‹РІР°СЋС‰РµРіРѕ РєРѕРґР°.
+//
+// Р¤СѓРЅРєС†РёСЏ РєРѕРїРёСЂСѓРµС‚ payload РёР· Р±СѓС„РµСЂР° Badger РїРµСЂРµРґ РґРµСЃРµСЂРёР°Р»РёР·Р°С†РёРµР№:
+// Badger РїРµСЂРµРёСЃРїРѕР»СЊР·СѓРµС‚ РІРЅСѓС‚СЂРµРЅРЅРёРµ Р±СѓС„РµСЂС‹, Рё РїСЂСЏРјР°СЏ СЃСЃС‹Р»РєР° РЅР° РЅРёС…
+// РїРѕСЃР»Рµ РІС‹С…РѕРґР° РёР· item.Value() РЅРµР±РµР·РѕРїР°СЃРЅР°.
+func (l *BadgerLedger) IterateEscrows(
+	fn func(dealID string, c *engine.EscrowContract) error,
+) error {
+	if fn == nil {
+		return errors.New("ledger: nil iteration function")
+	}
+	return l.db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+		prefix := []byte(EscrowKeyPrefix)
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			item := it.Item()
+			key := string(item.Key())
+			dealID := key[len(EscrowKeyPrefix):]
+
+			var payload []byte
+			if err := item.Value(func(v []byte) error {
+				payload = append([]byte(nil), v...)
+				return nil
+			}); err != nil {
+				return fmt.Errorf("ledger: read value %s: %w", dealID, err)
+			}
+
+			c, err := engine.DeserializeEscrow(payload)
+			if err != nil {
+				return fmt.Errorf("ledger: deserialize %s: %w", dealID, err)
+			}
+			if err := fn(dealID, c); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+
+// ============================================
+// FILE: badger_test.go
+// ============================================
+package ledger
+
+import (
+	"bytes"
+	"errors"
+	"strings"
+	"testing"
+
+	"nis-core/internal/engine"
+)
+
+// openTestLedger СЃРѕР·РґР°С‘С‚ BadgerLedger РІРѕ РІСЂРµРјРµРЅРЅРѕР№ РґРёСЂРµРєС‚РѕСЂРёРё С‚РµСЃС‚Р°.
+// t.TempDir() СѓРґР°Р»РёС‚ РµС‘ Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРё РїРѕ РѕРєРѕРЅС‡Р°РЅРёРё С‚РµСЃС‚Р°.
+func openTestLedger(t *testing.T) *BadgerLedger {
+	t.Helper()
+	dir := t.TempDir()
+	l, err := NewBadgerLedger(dir)
+	if err != nil {
+		t.Fatalf("NewBadgerLedger: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := l.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	return l
+}
+
+// sampleContract вЂ” РјРёРЅРёРјР°Р»СЊРЅРѕ РІР°Р»РёРґРЅС‹Р№ РєРѕРЅС‚СЂР°РєС‚ РґР»СЏ С‚РµСЃС‚РѕРІ.
+func sampleContract(dealID string) *engine.EscrowContract {
+	return &engine.EscrowContract{
+		DealID:    dealID,
+		Status:    engine.StatusLocked,
+		CreatedAt: 1_700_000_000,
+		UpdatedAt: 1_700_000_000,
+		TimeoutAt: 1_700_000_000 + 30*24*3600,
+		Token: engine.DigitalNISRubles{
+			TokenID:         strings.Repeat("a", 64),
+			Amount:          485_000_000,
+			TargetColorTag:  strings.Repeat("b", 64),
+			MilitaryIDHash:  strings.Repeat("c", 64),
+			BeneficiaryINN:  "7701982341",
+			CadastralNumber: "77:01:0001001:102",
+			IssuerSignature: bytes.Repeat([]byte{0xAB}, 64),
+			IssuedAt:        1_700_000_000,
+		},
+	}
+}
+
+// ---------- New / Close ----------
+
+func TestNewBadgerLedger_EmptyPath(t *testing.T) {
+	if _, err := NewBadgerLedger(""); err == nil {
+		t.Fatal("expected error for empty path")
+	}
+}
+
+func TestBadgerLedger_Close_Idempotent(t *testing.T) {
+	dir := t.TempDir()
+	l, err := NewBadgerLedger(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+	// Р’С‚РѕСЂРѕР№ Close РјРѕР¶РµС‚ РІРµСЂРЅСѓС‚СЊ РѕС€РёР±РєСѓ вЂ” РЅРѕ РЅРµ РґРѕР»Р¶РµРЅ РїР°РЅРёРєРѕРІР°С‚СЊ.
+	_ = l.Close()
+}
+
+// ---------- PutEscrow ----------
+
+func TestBadgerLedger_PutGet_Roundtrip(t *testing.T) {
+	l := openTestLedger(t)
+	c := sampleContract("DEAL-001")
+
+	if err := l.PutEscrow("DEAL-001", c); err != nil {
+		t.Fatalf("PutEscrow: %v", err)
+	}
+
+	got, err := l.GetEscrow("DEAL-001")
+	if err != nil {
+		t.Fatalf("GetEscrow: %v", err)
+	}
+	if got.DealID != "DEAL-001" {
+		t.Fatalf("DealID = %q, want DEAL-001", got.DealID)
+	}
+	if got.Token.Amount != c.Token.Amount {
+		t.Fatalf("Amount mismatch")
+	}
+	if !bytes.Equal(got.Token.IssuerSignature, c.Token.IssuerSignature) {
+		t.Fatal("IssuerSignature mismatch after roundtrip")
+	}
+}
+
+func TestBadgerLedger_Put_Conflict(t *testing.T) {
+	l := openTestLedger(t)
+	if err := l.PutEscrow("DEAL-001", sampleContract("DEAL-001")); err != nil {
+		t.Fatalf("first put: %v", err)
+	}
+	err := l.PutEscrow("DEAL-001", sampleContract("DEAL-001"))
+	if !errors.Is(err, engine.ErrConflict) {
+		t.Fatalf("err = %v, want ErrConflict", err)
+	}
+}
+
+func TestBadgerLedger_Put_EmptyDealID(t *testing.T) {
+	l := openTestLedger(t)
+	if err := l.PutEscrow("", sampleContract("x")); err == nil {
+		t.Fatal("expected error for empty dealID")
+	}
+}
+
+func TestBadgerLedger_Put_NilContract(t *testing.T) {
+	l := openTestLedger(t)
+	if err := l.PutEscrow("DEAL-001", nil); err == nil {
+		t.Fatal("expected error for nil contract")
+	}
+}
+
+// ---------- GetEscrow ----------
+
+func TestBadgerLedger_Get_NotFound(t *testing.T) {
+	l := openTestLedger(t)
+	_, err := l.GetEscrow("missing")
+	if !errors.Is(err, engine.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestBadgerLedger_Get_ReturnsCopy(t *testing.T) {
+	l := openTestLedger(t)
+	c := sampleContract("DEAL-001")
+	if err := l.PutEscrow("DEAL-001", c); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	got1, _ := l.GetEscrow("DEAL-001")
+	got1.Status = engine.StatusReleased
+	got1.Token.IssuerSignature[0] = 0xFF
+
+	got2, _ := l.GetEscrow("DEAL-001")
+	if got2.Status != engine.StatusLocked {
+		t.Fatalf("mutating returned contract affected storage: status=%s", got2.Status)
+	}
+	if got2.Token.IssuerSignature[0] == 0xFF {
+		t.Fatal("mutating returned signature affected storage")
+	}
+}
+
+// ---------- UpdateEscrow ----------
+
+func TestBadgerLedger_Update_Success(t *testing.T) {
+	l := openTestLedger(t)
+	if err := l.PutEscrow("DEAL-001", sampleContract("DEAL-001")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	err := l.UpdateEscrow("DEAL-001", func(c *engine.EscrowContract) error {
+		c.Status = engine.StatusReleased
+		c.SettlementTxID = "tx-abc"
+		c.UpdatedAt = 1_800_000_000
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("UpdateEscrow: %v", err)
+	}
+
+	got, _ := l.GetEscrow("DEAL-001")
+	if got.Status != engine.StatusReleased {
+		t.Fatalf("status = %s, want %s", got.Status, engine.StatusReleased)
+	}
+	if got.SettlementTxID != "tx-abc" {
+		t.Fatalf("SettlementTxID = %q", got.SettlementTxID)
+	}
+	if got.UpdatedAt != 1_800_000_000 {
+		t.Fatalf("UpdatedAt = %d", got.UpdatedAt)
+	}
+}
+
+func TestBadgerLedger_Update_Error_NoChange(t *testing.T) {
+	l := openTestLedger(t)
+	if err := l.PutEscrow("DEAL-001", sampleContract("DEAL-001")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	// fn РІРѕР·РІСЂР°С‰Р°РµС‚ РѕС€РёР±РєСѓ вЂ” РёР·РјРµРЅРµРЅРёСЏ РґРѕР»Р¶РЅС‹ Р±С‹С‚СЊ РѕС‚РєР°С‡РµРЅС‹.
+	sentinel := errors.New("boom")
+	err := l.UpdateEscrow("DEAL-001", func(c *engine.EscrowContract) error {
+		c.Status = engine.StatusReleased
+		c.SettlementTxID = "SHOULD-NOT-PERSIST"
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("err = %v, want sentinel", err)
+	}
+
+	// РЎРѕСЃС‚РѕСЏРЅРёРµ РІ Р‘Р” РґРѕР»Р¶РЅРѕ Р±С‹С‚СЊ РїСЂРµР¶РЅРёРј.
+	got, _ := l.GetEscrow("DEAL-001")
+	if got.Status != engine.StatusLocked {
+		t.Fatalf("status changed despite fn error: %s", got.Status)
+	}
+	if got.SettlementTxID != "" {
+		t.Fatalf("SettlementTxID leaked despite fn error: %q", got.SettlementTxID)
+	}
+}
+
+func TestBadgerLedger_Update_NotFound(t *testing.T) {
+	l := openTestLedger(t)
+	err := l.UpdateEscrow("missing", func(c *engine.EscrowContract) error {
+		return nil
+	})
+	if !errors.Is(err, engine.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestBadgerLedger_Update_NilFn(t *testing.T) {
+	l := openTestLedger(t)
+	if err := l.PutEscrow("DEAL-001", sampleContract("DEAL-001")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := l.UpdateEscrow("DEAL-001", nil); err == nil {
+		t.Fatal("expected error for nil fn")
+	}
+}
+
+// ---------- РџРµСЂСЃРёСЃС‚РµРЅС‚РЅРѕСЃС‚СЊ ----------
+
+func TestBadgerLedger_Persistence_AcrossReopen(t *testing.T) {
+	dir := t.TempDir()
+
+	// РџРµСЂРІР°СЏ СЃРµСЃСЃРёСЏ: РїРёС€РµРј.
+	{
+		l, err := NewBadgerLedger(dir)
+		if err != nil {
+			t.Fatalf("open 1: %v", err)
+		}
+		if err := l.PutEscrow("DEAL-P", sampleContract("DEAL-P")); err != nil {
+			t.Fatalf("put: %v", err)
+		}
+		if err := l.Close(); err != nil {
+			t.Fatalf("close 1: %v", err)
+		}
+	}
+
+	// Р’С‚РѕСЂР°СЏ СЃРµСЃСЃРёСЏ: С‡РёС‚Р°РµРј.
+	{
+		l, err := NewBadgerLedger(dir)
+		if err != nil {
+			t.Fatalf("open 2: %v", err)
+		}
+		defer l.Close()
+
+		got, err := l.GetEscrow("DEAL-P")
+		if err != nil {
+			t.Fatalf("get after reopen: %v", err)
+		}
+		if got.DealID != "DEAL-P" {
+			t.Fatalf("DealID = %q", got.DealID)
+		}
+		if got.Status != engine.StatusLocked {
+			t.Fatalf("status = %s", got.Status)
+		}
+	}
+}
+
+
+// ============================================
+// FILE: client.go
+// ============================================
+// Package oracle СЂРµР°Р»РёР·СѓРµС‚ РєР»РёРµРЅС‚Р° Рё РІРµСЂРёС„РёРєР°С‚РѕСЂ РѕСЂР°РєСѓР»Р° Р РѕСЃСЂРµРµСЃС‚СЂР°.
+//
+// Р Р°Р·РґРµР»РµРЅРёРµ РѕС‚РІРµС‚СЃС‚РІРµРЅРЅРѕСЃС‚Рё:
+//   - Client   вЂ” С‚СЂР°РЅСЃРїРѕСЂС‚: HTTP/HTTPS-РІС‹Р·РѕРІС‹ Рє РІРЅРµС€РЅРµРјСѓ СЃРµСЂРІРёСЃСѓ Р•Р“Р Рќ;
+//   - Verifier вЂ” РєСЂРёРїС‚РѕРіСЂР°С„РёСЏ: РїСЂРѕРІРµСЂРєР° РїРѕРґРїРёСЃРё Р“РћРЎРў Р  34.10-2012
+//     РЅР° РѕС‚РІРµС‚Рµ РѕСЂР°РєСѓР»Р°.
+//
+// РЎР»РѕР№ oracle РќР• Р·РЅР°РµС‚ РїСЂРѕ engine Рё РµРіРѕ СЃС‚Р°С‚СѓСЃС‹. Р—Р°РґР°С‡Р° РїР°РєРµС‚Р° вЂ”
+// РґРѕСЃС‚Р°РІРёС‚СЊ РґР°РЅРЅС‹Рµ Рё РїРѕРґС‚РІРµСЂРґРёС‚СЊ РёС… РїРѕРґР»РёРЅРЅРѕСЃС‚СЊ. Р РµС€РµРЅРёРµ Рѕ С‚РѕРј,
+// С‡С‚Рѕ РґРµР»Р°С‚СЊ СЃ РѕС‚РІРµС‚РѕРј (released/refunded) вЂ” РІ engine.
+package oracle
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"time"
+)
+
+const (
+	// DefaultTimeout вЂ” С‚Р°Р№РјР°СѓС‚ HTTP-Р·Р°РїСЂРѕСЃР° РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ.
+	DefaultTimeout = 10 * time.Second
+
+	// maxResponseSize вЂ” РјР°РєСЃРёРјР°Р»СЊРЅС‹Р№ СЂР°Р·РјРµСЂ С‚РµР»Р° РѕС‚РІРµС‚Р° (1 РњРёР‘).
+	maxResponseSize = 1 << 20
+
+	// pathRegister вЂ” СЌРЅРґРїРѕРёРЅС‚ СЂРµРіРёСЃС‚СЂР°С†РёРё СЃРґРµР»РєРё.
+	pathRegister = "/api/v1/register"
+)
+
+// РћС€РёР±РєРё РєР»РёРµРЅС‚Р°.
+var (
+	ErrNilRequest     = errors.New("oracle: nil request")
+	ErrEmptyBaseURL   = errors.New("oracle: empty base URL")
+	ErrHTTPStatus     = errors.New("oracle: unexpected HTTP status")
+	ErrEmptyResponse  = errors.New("oracle: empty response body")
+	ErrResponseTooBig = errors.New("oracle: response body exceeds limit")
+	ErrTLSCertLoad    = errors.New("oracle: cannot load TLS certificate")
+)
+
+// RegisterRequest вЂ” Р·Р°РїСЂРѕСЃ РЅР° СЂРµРіРёСЃС‚СЂР°С†РёСЋ РїРµСЂРµС…РѕРґР° РїСЂР°РІР° СЃРѕР±СЃС‚РІРµРЅРЅРѕСЃС‚Рё.
+type RegisterRequest struct {
+	DealID  string `json:"deal_id"`
+	Kadastr string `json:"kadastr"`
+}
+
+// RegisterResponse вЂ” РѕС‚РІРµС‚ РѕСЂР°РєСѓР»Р° Р РѕСЃСЂРµРµСЃС‚СЂР°.
+type RegisterResponse struct {
+	DealID    string `json:"deal_id"`
+	Kadastr   string `json:"kadastr"`
+	Success   bool   `json:"success"`
+	Signature []byte `json:"signature"` // Р“РћРЎРў Р  34.10-2012
+}
+
+// Client вЂ” HTTP-РєР»РёРµРЅС‚ Рє СЃРµСЂРІРёСЃСѓ РѕСЂР°РєСѓР»Р° Р РѕСЃСЂРµРµСЃС‚СЂР°.
+type Client struct {
+	baseURL string
+	http    *http.Client
+}
+
+// NewClient СЃРѕР·РґР°С‘С‚ РєР»РёРµРЅС‚Р° Р±РµР· TLS (РґР»СЏ Р»РѕРєР°Р»СЊРЅРѕРіРѕ С‚РµСЃС‚РёСЂРѕРІР°РЅРёСЏ РёР»Рё
+// РґР»СЏ СЃР»СѓС‡Р°РµРІ, РєРѕРіРґР° TLS С‚РµСЂРјРёРЅРёСЂСѓРµС‚СЃСЏ РЅР° РІРЅРµС€РЅРµРј РїСЂРѕРєСЃРё).
+func NewClient(baseURL string, httpClient *http.Client) (*Client, error) {
+	if baseURL == "" {
+		return nil, ErrEmptyBaseURL
+	}
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: DefaultTimeout}
+	}
+	return &Client{baseURL: baseURL, http: httpClient}, nil
+}
+
+// NewMTLSClient СЃРѕР·РґР°С‘С‚ РєР»РёРµРЅС‚Р° СЃ РґРІСѓСЃС‚РѕСЂРѕРЅРЅРµР№ TLS-Р°СѓС‚РµРЅС‚РёС„РёРєР°С†РёРµР№.
+//
+// РџР°СЂР°РјРµС‚СЂС‹:
+//   - caCertPath:     РїСѓС‚СЊ Рє РєРѕСЂРЅРµРІРѕРјСѓ СЃРµСЂС‚РёС„РёРєР°С‚Сѓ (ca.crt);
+//   - clientCertPath: РїСѓС‚СЊ Рє РєР»РёРµРЅС‚СЃРєРѕРјСѓ СЃРµСЂС‚РёС„РёРєР°С‚Сѓ (client.crt);
+//   - clientKeyPath:  РїСѓС‚СЊ Рє РєР»РёРµРЅС‚СЃРєРѕРјСѓ РєР»СЋС‡Сѓ (client.key).
+//
+// РЎРµСЂРІРµСЂ С‚РѕР¶Рµ РґРѕР»Р¶РµРЅ РїСЂРµРґСЉСЏРІРёС‚СЊ РІР°Р»РёРґРЅС‹Р№ СЃРµСЂС‚РёС„РёРєР°С‚, РїРѕРґРїРёСЃР°РЅРЅС‹Р№ С‚РµРј Р¶Рµ CA.
+func NewMTLSClient(
+	baseURL, caCertPath, clientCertPath, clientKeyPath string,
+) (*Client, error) {
+	if baseURL == "" {
+		return nil, ErrEmptyBaseURL
+	}
+
+	caPEM, err := os.ReadFile(caCertPath)
+	if err != nil {
+		return nil, fmt.Errorf("%w: ca.crt: %v", ErrTLSCertLoad, err)
+	}
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("%w: ca.crt has no valid certificates", ErrTLSCertLoad)
+	}
+
+	clientCert, err := tls.LoadX509KeyPair(clientCertPath, clientKeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("%w: client pair: %v", ErrTLSCertLoad, err)
+	}
+
+	tlsCfg := &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		RootCAs:      caPool,
+		Certificates: []tls.Certificate{clientCert},
+		ServerName:   "localhost",
+	}
+
+	return &Client{
+		baseURL: baseURL,
+		http: &http.Client{
+			Timeout: DefaultTimeout,
+			Transport: &http.Transport{
+				TLSClientConfig: tlsCfg,
+			},
+		},
+	}, nil
+}
+
+// Register РѕС‚РїСЂР°РІР»СЏРµС‚ Р·Р°РїСЂРѕСЃ РЅР° СЂРµРіРёСЃС‚СЂР°С†РёСЋ СЃРґРµР»РєРё Рё РІРѕР·РІСЂР°С‰Р°РµС‚ РѕС‚РІРµС‚.
+// РќРµ РїСЂРѕРІРµСЂСЏРµС‚ РїРѕРґРїРёСЃСЊ вЂ” СЌС‚Рѕ Р·Р°РґР°С‡Р° Verifier.
+func (c *Client) Register(ctx context.Context, req *RegisterRequest) (*RegisterResponse, error) {
+	if req == nil {
+		return nil, ErrNilRequest
+	}
+	if req.DealID == "" || req.Kadastr == "" {
+		return nil, fmt.Errorf("oracle: dealID and kadastr are required")
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("oracle: marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, c.baseURL+pathRegister, bytes.NewReader(body),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("oracle: build request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+
+	resp, err := c.http.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("oracle: do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	limited := io.LimitReader(resp.Body, maxResponseSize+1)
+	respBody, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, fmt.Errorf("oracle: read body: %w", err)
+	}
+	if int64(len(respBody)) > maxResponseSize {
+		return nil, ErrResponseTooBig
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: %d %s",
+			ErrHTTPStatus, resp.StatusCode, string(respBody))
+	}
+	if len(respBody) == 0 {
+		return nil, ErrEmptyResponse
+	}
+
+	var out RegisterResponse
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, fmt.Errorf("oracle: unmarshal response: %w", err)
+	}
+	return &out, nil
+}
+
+
+// ============================================
+// FILE: client_test.go
+// ============================================
+package oracle
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/bi-zone/ruwireguard-go/crypto/gost/gost3410"
+
+	"nis-core/internal/crypto"
+)
+
+// testServer Р·Р°РїСѓСЃРєР°РµС‚ httptest.Server, РєРѕС‚РѕСЂС‹Р№ РІРѕР·РІСЂР°С‰Р°РµС‚
+// РїРѕРґРїРёСЃР°РЅРЅС‹Р№ РѕС‚РІРµС‚ РѕСЂР°РєСѓР»Р° РЅР° Р·Р°РїСЂРѕСЃ /api/v1/register.
+func testServer(t *testing.T, g *crypto.GOSTProvider, priv *gost3410.PrivateKey) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req RegisterRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+
+		digest := g.OracleResponseDigest(req.DealID, req.Kadastr, true)
+		sig, err := g.SignGOST3410(priv, digest)
+		if err != nil {
+			http.Error(w, "sign error", http.StatusInternalServerError)
+			return
+		}
+
+		resp := RegisterResponse{
+			DealID:    req.DealID,
+			Kadastr:   req.Kadastr,
+			Success:   true,
+			Signature: sig,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+}
+
+// ---------- Client ----------
+
+func TestNewClient_EmptyBaseURL(t *testing.T) {
+	if _, err := NewClient("", nil); err == nil {
+		t.Fatal("expected error for empty base URL")
+	}
+}
+
+func TestClient_Register_HappyPath(t *testing.T) {
+	g := crypto.NewGOSTProvider()
+	priv, pub, _ := g.GenerateKeyPair()
+	srv := testServer(t, g, priv)
+	defer srv.Close()
+
+	c, err := NewClient(srv.URL, nil)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := c.Register(ctx, &RegisterRequest{
+		DealID:  "DEAL-001",
+		Kadastr: "77:01:0001001:102",
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if resp.DealID != "DEAL-001" {
+		t.Fatalf("dealID = %q", resp.DealID)
+	}
+	if !resp.Success {
+		t.Fatal("expected success=true")
+	}
+
+	v, err := NewVerifier(g, pub)
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	if err := v.VerifyResponse(resp, "DEAL-001", "77:01:0001001:102"); err != nil {
+		t.Fatalf("VerifyResponse: %v", err)
+	}
+}
+
+func TestClient_Register_NilRequest(t *testing.T) {
+	c, _ := NewClient("http://localhost", nil)
+	if _, err := c.Register(context.Background(), nil); !errors.Is(err, ErrNilRequest) {
+		t.Fatalf("err = %v, want ErrNilRequest", err)
+	}
+}
+
+func TestClient_Register_EmptyFields(t *testing.T) {
+	c, _ := NewClient("http://localhost", nil)
+	_, err := c.Register(context.Background(), &RegisterRequest{DealID: "X"})
+	if err == nil {
+		t.Fatal("expected error for missing kadastr")
+	}
+}
+
+func TestClient_Register_HTTPError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "internal", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	c, _ := NewClient(srv.URL, nil)
+	_, err := c.Register(context.Background(), &RegisterRequest{
+		DealID: "D", Kadastr: "K",
+	})
+	if !errors.Is(err, ErrHTTPStatus) {
+		t.Fatalf("err = %v, want ErrHTTPStatus", err)
+	}
+}
+
+func TestClient_Register_ContextCancelled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(500 * time.Millisecond)
+	}))
+	defer srv.Close()
+
+	c, _ := NewClient(srv.URL, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err := c.Register(ctx, &RegisterRequest{DealID: "D", Kadastr: "K"})
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+}
+
+// ---------- Verifier ----------
+
+func TestVerifier_NilArgs(t *testing.T) {
+	g := crypto.NewGOSTProvider()
+	_, pub, _ := g.GenerateKeyPair()
+
+	if _, err := NewVerifier(nil, pub); err == nil {
+		t.Fatal("expected error for nil crypto")
+	}
+	if _, err := NewVerifier(g, nil); err == nil {
+		t.Fatal("expected error for nil pub key")
+	}
+
+	v, _ := NewVerifier(g, pub)
+	if err := v.VerifyResponse(nil, "d", "k"); !errors.Is(err, ErrNilResponse) {
+		t.Fatalf("err = %v, want ErrNilResponse", err)
+	}
+}
+
+func TestVerifier_EmptySignature(t *testing.T) {
+	g := crypto.NewGOSTProvider()
+	_, pub, _ := g.GenerateKeyPair()
+	v, _ := NewVerifier(g, pub)
+
+	resp := &RegisterResponse{DealID: "D", Kadastr: "K", Success: true}
+	if err := v.VerifyResponse(resp, "D", "K"); !errors.Is(err, ErrEmptySignature) {
+		t.Fatalf("err = %v, want ErrEmptySignature", err)
+	}
+}
+
+func TestVerifier_DealMismatch(t *testing.T) {
+	g := crypto.NewGOSTProvider()
+	priv, pub, _ := g.GenerateKeyPair()
+	v, _ := NewVerifier(g, pub)
+
+	digest := g.OracleResponseDigest("D1", "K", true)
+	sig, _ := g.SignGOST3410(priv, digest)
+
+	resp := &RegisterResponse{DealID: "D1", Kadastr: "K", Success: true, Signature: sig}
+	// РћР¶РёРґР°РµРј РґСЂСѓРіРѕР№ dealID вЂ” РІРµСЂРёС„РёРєР°С†РёСЏ РґРѕР»Р¶РЅР° РїСЂРѕРІР°Р»РёС‚СЊСЃСЏ РґРѕ РєСЂРёРїС‚Рѕ.
+	if err := v.VerifyResponse(resp, "D2", "K"); !errors.Is(err, ErrDealMismatch) {
+		t.Fatalf("err = %v, want ErrDealMismatch", err)
+	}
+}
+
+func TestVerifier_KadastrMismatch(t *testing.T) {
+	g := crypto.NewGOSTProvider()
+	priv, pub, _ := g.GenerateKeyPair()
+	v, _ := NewVerifier(g, pub)
+
+	digest := g.OracleResponseDigest("D", "K1", true)
+	sig, _ := g.SignGOST3410(priv, digest)
+
+	resp := &RegisterResponse{DealID: "D", Kadastr: "K1", Success: true, Signature: sig}
+	if err := v.VerifyResponse(resp, "D", "K2"); !errors.Is(err, ErrKadastrMismatch) {
+		t.Fatalf("err = %v, want ErrKadastrMismatch", err)
+	}
+}
+
+func TestVerifier_BadSignature(t *testing.T) {
+	g := crypto.NewGOSTProvider()
+	priv, pub, _ := g.GenerateKeyPair()
+	v, _ := NewVerifier(g, pub)
+
+	digest := g.OracleResponseDigest("D", "K", true)
+	sig, _ := g.SignGOST3410(priv, digest)
+	sig[0] ^= 0x01
+
+	resp := &RegisterResponse{DealID: "D", Kadastr: "K", Success: true, Signature: sig}
+	if err := v.VerifyResponse(resp, "D", "K"); !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("err = %v, want ErrBadSignature", err)
+	}
+}
+
+func TestVerifier_SuccessFlagTampered(t *testing.T) {
+	// РћСЂР°РєСѓР» РїРѕРґРїРёСЃР°Р» success=true, Р°С‚Р°РєСѓСЋС‰РёР№ РїРѕРґРјРµРЅРёР» РЅР° false.
+	g := crypto.NewGOSTProvider()
+	priv, pub, _ := g.GenerateKeyPair()
+	v, _ := NewVerifier(g, pub)
+
+	digest := g.OracleResponseDigest("D", "K", true)
+	sig, _ := g.SignGOST3410(priv, digest)
+
+	resp := &RegisterResponse{DealID: "D", Kadastr: "K", Success: false, Signature: sig}
+	if err := v.VerifyResponse(resp, "D", "K"); !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("err = %v, want ErrBadSignature", err)
+	}
+}
+
+
+// ============================================
+// FILE: tls.go
+// ============================================
+// Package oracle вЂ” РіРµРЅРµСЂР°С‚РѕСЂ СЃР°РјРѕРїРѕРґРїРёСЃР°РЅРЅС‹С… X.509-СЃРµСЂС‚РёС„РёРєР°С‚РѕРІ
+// РґР»СЏ mTLS-С‚СЂР°РЅСЃРїРѕСЂС‚Р° РјРµР¶РґСѓ СѓР·Р»РѕРј Рё РѕСЂР°РєСѓР»РѕРј.
+//
+// Р’РђР–РќРћ: РїСЂРѕС‚РѕС‚РёРї РёСЃРїРѕР»СЊР·СѓРµС‚ СЃС‚Р°РЅРґР°СЂС‚РЅС‹Р№ TLS 1.3 СЃ ECDSA-СЃРµСЂС‚РёС„РёРєР°С‚Р°РјРё
+// (P-256). Р­С‚Рѕ С‚СЂР°РЅСЃРїРѕСЂС‚РЅС‹Р№ СѓСЂРѕРІРµРЅСЊ, РЅРµ РїСѓС‚Р°С‚СЊ СЃ Р“РћРЎРў TLS (RFC 4357),
+// РєРѕС‚РѕСЂС‹Р№ С‚СЂРµР±СѓРµС‚ СЃРµСЂС‚РёС„РёС†РёСЂРѕРІР°РЅРЅРѕРіРѕ РЎРљР—Р. РџСЂРёРєР»Р°РґРЅР°СЏ РєСЂРёРїС‚РѕРіСЂР°С„РёСЏ
+// РѕСЃС‚Р°С‘С‚СЃСЏ Р“РћРЎРў Р  34.10-2012 РЅР° СѓСЂРѕРІРЅРµ payload.
+//
+// Р’ РїСЂРѕРјС‹С€Р»РµРЅРЅРѕР№ СЌРєСЃРїР»СѓР°С‚Р°С†РёРё СЌС‚РѕС‚ СЃР»РѕР№ Р·Р°РјРµРЅСЏРµС‚СЃСЏ РЅР° Р“РћРЎРў TLS
+// С‡РµСЂРµР· РљСЂРёРїС‚РѕРџСЂРѕ CSP вЂ” РёРЅС‚РµСЂС„РµР№СЃС‹ Oracle.Client Рё cmd/oracle-rosreestr
+// РЅРµ Р·Р°РІРёСЃСЏС‚ РѕС‚ РєРѕРЅРєСЂРµС‚РЅРѕР№ СЂРµР°Р»РёР·Р°С†РёРё TLS.
+package oracle
+
+import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"math/big"
+	"net"
+	"os"
+	"path/filepath"
+	"time"
+)
+
+const (
+	// CertValidity вЂ” СЃСЂРѕРє РґРµР№СЃС‚РІРёСЏ РіРµРЅРµСЂРёСЂСѓРµРјС‹С… СЃРµСЂС‚РёС„РёРєР°С‚РѕРІ.
+	CertValidity = 365 * 24 * time.Hour
+	// CertOrg вЂ” РѕСЂРіР°РЅРёР·Р°С†РёСЏ РІ subject СЃРµСЂС‚РёС„РёРєР°С‚Р°.
+	CertOrg = "Digital NIS Prototype"
+)
+
+// certCurve РІРѕР·РІСЂР°С‰Р°РµС‚ СЌР»Р»РёРїС‚РёС‡РµСЃРєСѓСЋ РєСЂРёРІСѓСЋ РґР»СЏ СЃРµСЂС‚РёС„РёРєР°С‚РѕРІ.
+// Р’ РЅРѕРІС‹С… РІРµСЂСЃРёСЏС… Go elliptic.P256 вЂ” С„СѓРЅРєС†РёСЏ, Р° РЅРµ РєРѕРЅСЃС‚Р°РЅС‚Р°,
+// РїРѕСЌС‚РѕРјСѓ РІС‹РЅРµСЃРµРЅРѕ РѕС‚РґРµР»СЊРЅРѕ.
+func certCurve() elliptic.Curve {
+	return elliptic.P256()
+}
+
+// CertBundle вЂ” СЂРµР·СѓР»СЊС‚Р°С‚ РіРµРЅРµСЂР°С†РёРё: РїСѓС‚Рё РєРѕ РІСЃРµРј С„Р°Р№Р»Р°Рј.
+type CertBundle struct {
+	CAPath         string
+	CAKeyPath      string
+	ServerCertPath string
+	ServerKeyPath  string
+	ClientCertPath string
+	ClientKeyPath  string
+}
+
+// GenerateCertBundle РіРµРЅРµСЂРёСЂСѓРµС‚ РїРѕР»РЅС‹Р№ РЅР°Р±РѕСЂ СЃРµСЂС‚РёС„РёРєР°С‚РѕРІ РґР»СЏ mTLS
+// РІ СѓРєР°Р·Р°РЅРЅРѕР№ РґРёСЂРµРєС‚РѕСЂРёРё:
+//
+//   - ca.crt, ca.key       вЂ” РєРѕСЂРЅРµРІРѕР№ CA (СЃР°РјРѕРїРѕРґРїРёСЃР°РЅРЅС‹Р№);
+//   - server.crt, server.key вЂ” СЃРµСЂРІРµСЂРЅС‹Р№ СЃРµСЂС‚РёС„РёРєР°С‚ РґР»СЏ oracle-СЃРµСЂРІРёСЃР°;
+//   - client.crt, client.key вЂ” РєР»РёРµРЅС‚СЃРєРёР№ СЃРµСЂС‚РёС„РёРєР°С‚ РґР»СЏ nis-node.
+//
+// РЎРµСЂРІРµСЂРЅС‹Р№ Рё РєР»РёРµРЅС‚СЃРєРёР№ СЃРµСЂС‚РёС„РёРєР°С‚С‹ РїРѕРґРїРёСЃР°РЅС‹ CA. РџСЂРё mTLS-СЃРѕРµРґРёРЅРµРЅРёРё
+// РѕР±Рµ СЃС‚РѕСЂРѕРЅС‹ РїСЂРѕРІРµСЂСЏСЋС‚ СЃРµСЂС‚РёС„РёРєР°С‚С‹ РґСЂСѓРі РґСЂСѓРіР° С‡РµСЂРµР· ca.crt.
+func GenerateCertBundle(dir string) (*CertBundle, error) {
+	if dir == "" {
+		return nil, errors.New("oracle: empty cert dir")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("oracle: create cert dir: %w", err)
+	}
+
+	bundle := &CertBundle{
+		CAPath:         filepath.Join(dir, "ca.crt"),
+		CAKeyPath:      filepath.Join(dir, "ca.key"),
+		ServerCertPath: filepath.Join(dir, "server.crt"),
+		ServerKeyPath:  filepath.Join(dir, "server.key"),
+		ClientCertPath: filepath.Join(dir, "client.crt"),
+		ClientKeyPath:  filepath.Join(dir, "client.key"),
+	}
+
+	// 1. CA.
+	caKey, err := ecdsa.GenerateKey(certCurve(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("oracle: gen ca key: %w", err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          serialNumber(),
+		Subject:               pkix.Name{Organization: []string{CertOrg + " CA"}, CommonName: "NIS Root CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(CertValidity * 5),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLen:            1,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		return nil, fmt.Errorf("oracle: create ca cert: %w", err)
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		return nil, fmt.Errorf("oracle: parse ca cert: %w", err)
+	}
+	if err := writeCertAndKey(bundle.CAPath, bundle.CAKeyPath, caDER, caKey); err != nil {
+		return nil, err
+	}
+
+	// 2. РЎРµСЂРІРµСЂРЅС‹Р№ СЃРµСЂС‚РёС„РёРєР°С‚.
+	if err := issueLeaf(
+		caCert, caKey,
+		bundle.ServerCertPath, bundle.ServerKeyPath,
+		"nis-oracle-server", true,
+	); err != nil {
+		return nil, err
+	}
+
+	// 3. РљР»РёРµРЅС‚СЃРєРёР№ СЃРµСЂС‚РёС„РёРєР°С‚.
+	if err := issueLeaf(
+		caCert, caKey,
+		bundle.ClientCertPath, bundle.ClientKeyPath,
+		"nis-node-client", false,
+	); err != nil {
+		return nil, err
+	}
+
+	return bundle, nil
+}
+
+// issueLeaf РІС‹РїСѓСЃРєР°РµС‚ РєРѕРЅРµС‡РЅС‹Р№ (leaf) СЃРµСЂС‚РёС„РёРєР°С‚, РїРѕРґРїРёСЃР°РЅРЅС‹Р№ CA.
+func issueLeaf(
+	caCert *x509.Certificate,
+	caKey *ecdsa.PrivateKey,
+	certPath, keyPath, cn string,
+	isServer bool,
+) error {
+	leafKey, err := ecdsa.GenerateKey(certCurve(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("oracle: gen leaf key: %w", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: serialNumber(),
+		Subject:      pkix.Name{Organization: []string{CertOrg}, CommonName: cn},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(CertValidity),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+	}
+	if isServer {
+		tmpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+		tmpl.DNSNames = []string{"localhost"}
+		tmpl.IPAddresses = []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
+	} else {
+		tmpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, &leafKey.PublicKey, caKey)
+	if err != nil {
+		return fmt.Errorf("oracle: create leaf cert: %w", err)
+	}
+	return writeCertAndKey(certPath, keyPath, der, leafKey)
+}
+
+// writeCertAndKey СЃРѕС…СЂР°РЅСЏРµС‚ СЃРµСЂС‚РёС„РёРєР°С‚ Рё РєР»СЋС‡ РІ PEM-С„РѕСЂРјР°С‚Рµ.
+func writeCertAndKey(certPath, keyPath string, der []byte, key *ecdsa.PrivateKey) error {
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	if err := os.WriteFile(certPath, certPEM, 0o644); err != nil {
+		return fmt.Errorf("oracle: write cert %q: %w", certPath, err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return fmt.Errorf("oracle: marshal key: %w", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		return fmt.Errorf("oracle: write key %q: %w", keyPath, err)
+	}
+	return nil
+}
+
+// serialNumber РіРµРЅРµСЂРёСЂСѓРµС‚ СЃР»СѓС‡Р°Р№РЅС‹Р№ СЃРµСЂРёР№РЅС‹Р№ РЅРѕРјРµСЂ СЃРµСЂС‚РёС„РёРєР°С‚Р°.
+func serialNumber() *big.Int {
+	max := new(big.Int).Lsh(big.NewInt(1), 128)
+	n, _ := rand.Int(rand.Reader, max)
+	return n
+}
+
+
+// ============================================
+// FILE: verifier.go
+// ============================================
+package oracle
+
+import (
+	"crypto/subtle"
+	"errors"
+	"fmt"
+
+	"github.com/bi-zone/ruwireguard-go/crypto/gost/gost3410"
+
+	"nis-core/internal/crypto"
+)
+
+// РћС€РёР±РєРё РІРµСЂРёС„РёРєР°С‚РѕСЂР°.
+var (
+	ErrNilVerifier     = errors.New("oracle: nil verifier")
+	ErrNilResponse     = errors.New("oracle: nil response")
+	ErrDealMismatch    = errors.New("oracle: response dealID does not match request")
+	ErrKadastrMismatch = errors.New("oracle: response kadastr does not match request")
+	ErrBadSignature    = errors.New("oracle: signature verification failed")
+	ErrEmptySignature  = errors.New("oracle: empty signature")
+)
+
+// Verifier РїСЂРѕРІРµСЂСЏРµС‚ РїРѕРґРїРёСЃРё РѕСЂР°РєСѓР»Р° Р РѕСЃСЂРµРµСЃС‚СЂР° РїРѕ Р“РћРЎРў Р  34.10-2012.
+type Verifier struct {
+	g      *crypto.GOSTProvider
+	pubKey *gost3410.PublicKey
+}
+
+// NewVerifier СЃРѕР·РґР°С‘С‚ РІРµСЂРёС„РёРєР°С‚РѕСЂ СЃ РїСѓР±Р»РёС‡РЅС‹Рј РєР»СЋС‡РѕРј РѕСЂР°РєСѓР»Р°.
+func NewVerifier(g *crypto.GOSTProvider, pub *gost3410.PublicKey) (*Verifier, error) {
+	if g == nil {
+		return nil, errors.New("oracle: nil crypto provider")
+	}
+	if pub == nil {
+		return nil, errors.New("oracle: nil public key")
+	}
+	return &Verifier{g: g, pubKey: pub}, nil
+}
+
+// VerifyResponse РїСЂРѕРІРµСЂСЏРµС‚ РїРѕРґРїРёСЃСЊ РѕС‚РІРµС‚Р° РѕСЂР°РєСѓР»Р°.
+//
+// РџСЂРѕРІРµСЂРєРё:
+//  1. РќРµРЅСѓР»РµРІРѕР№ РѕС‚РІРµС‚ Рё РїРѕРґРїРёСЃСЊ.
+//  2. dealID Рё kadastr РІ РѕС‚РІРµС‚Рµ СЃРѕРІРїР°РґР°СЋС‚ СЃ РѕР¶РёРґР°РµРјС‹РјРё
+//     (Р·Р°С‰РёС‚Р° РѕС‚ РїРѕРґРјРµРЅС‹ В«С‡СѓР¶РѕРіРѕВ» РѕС‚РІРµС‚Р°).
+//  3. РџРѕРґРїРёСЃСЊ РІР°Р»РёРґРЅР° РґР»СЏ digest С„РѕСЂРјР°С‚Р° OracleResponseDigest.
+func (v *Verifier) VerifyResponse(
+	resp *RegisterResponse,
+	expectedDealID, expectedKadastr string,
+) error {
+	if v == nil {
+		return ErrNilVerifier
+	}
+	if resp == nil {
+		return ErrNilResponse
+	}
+	if len(resp.Signature) == 0 {
+		return ErrEmptySignature
+	}
+	if len(resp.Signature) != crypto.GOST3410SignatureSize {
+		return fmt.Errorf("oracle: signature must be %d bytes, got %d",
+			crypto.GOST3410SignatureSize, len(resp.Signature))
+	}
+
+	// Constant-time СЃСЂР°РІРЅРµРЅРёРµ dealID Рё kadastr вЂ” РЅР° СЃР»СѓС‡Р°Р№,
+	// РµСЃР»Рё РѕР¶РёРґР°РµРјС‹Рµ Р·РЅР°С‡РµРЅРёСЏ РїСЂРёС€Р»Рё РёР· РЅРµРґРѕРІРµСЂРµРЅРЅРѕРіРѕ РёСЃС‚РѕС‡РЅРёРєР°.
+	if subtle.ConstantTimeCompare(
+		[]byte(resp.DealID), []byte(expectedDealID),
+	) != 1 {
+		return ErrDealMismatch
+	}
+	if subtle.ConstantTimeCompare(
+		[]byte(resp.Kadastr), []byte(expectedKadastr),
+	) != 1 {
+		return ErrKadastrMismatch
+	}
+
+	digest := v.g.OracleResponseDigest(resp.DealID, resp.Kadastr, resp.Success)
+	ok, err := v.g.VerifyGOST3410(v.pubKey, digest, resp.Signature)
+	if err != nil {
+		return fmt.Errorf("oracle: verify: %w", err)
+	}
+	if !ok {
+		return ErrBadSignature
+	}
+	return nil
+}
+
+
+// ============================================
+// FILE: envelope.go
+// ============================================
+// Package security СЂРµР°Р»РёР·СѓРµС‚ РєРѕРЅС‚СѓСЂ Zero Trust: РєРѕРЅРІРµСЂС‚ РґР»СЏ РєР°Р¶РґРѕРіРѕ
+// РјРµР¶СЃРµСЂРІРёСЃРЅРѕРіРѕ РІС‹Р·РѕРІР°, Р·Р°С‰РёС‰Р°СЋС‰РёР№ РѕС‚ replay-Р°С‚Р°Рє, РїРѕРґРјРµРЅС‹ payload
+// Рё РёСЃРїРѕР»СЊР·РѕРІР°РЅРёСЏ РЅРµРїСЂРѕРІРµСЂРµРЅРЅС‹С… СѓР·Р»РѕРІ.
+package security
+
+import (
+	"encoding/hex"
+	"errors"
+	"fmt"
+
+	"github.com/bi-zone/ruwireguard-go/crypto/gost/gost3410"
+
+	"nis-core/internal/crypto"
+)
+
+const (
+	// NonceSize вЂ” СЂР°Р·РјРµСЂ РѕРґРЅРѕСЂР°Р·РѕРІРѕРіРѕ РјР°СЂРєРµСЂР° РІ Р±Р°Р№С‚Р°С….
+	NonceSize = 16
+	// PayloadHashSize вЂ” СЂР°Р·РјРµСЂ С…СЌС€Р° payload (РЎС‚СЂРёР±РѕРі-256).
+	PayloadHashSize = crypto.StreebogSize
+	// EnvelopeSignatureSize вЂ” СЂР°Р·РјРµСЂ РїРѕРґРїРёСЃРё Р“РћРЎРў Р  34.10-2012.
+	EnvelopeSignatureSize = crypto.GOST3410SignatureSize
+)
+
+// РЎС‚СЂСѓРєС‚СѓСЂРЅС‹Рµ РѕС€РёР±РєРё РєРѕРЅРІРµСЂС‚Р°.
+var (
+	ErrEnvelopeNil            = errors.New("security: nil envelope")
+	ErrEnvelopeEmptySender    = errors.New("security: empty sender node id")
+	ErrEnvelopeBadNonce       = errors.New("security: nonce must be hex of 16 bytes")
+	ErrEnvelopeBadPayloadHash = errors.New("security: payload hash must be hex of 32 bytes")
+	ErrEnvelopeBadSignature   = errors.New("security: signature must be 64 bytes")
+)
+
+// ZeroTrustEnvelope вЂ” РєСЂРёРїС‚РѕРіСЂР°С„РёС‡РµСЃРєРёР№ РєРѕРЅРІРµСЂС‚ РѕРґРЅРѕРіРѕ РІС‹Р·РѕРІР°.
+//
+// Р¤РѕСЂРјР°С‚: {SenderNodeID, Timestamp, Nonce, PayloadHash, Signature}.
+// Payload РїРµСЂРµРґР°С‘С‚СЃСЏ РѕС‚РґРµР»СЊРЅРѕ вЂ” РєРѕРЅРІРµСЂС‚ РЅРµСЃС‘С‚ С‚РѕР»СЊРєРѕ РµРіРѕ С…СЌС€.
+type ZeroTrustEnvelope struct {
+	SenderNodeID string `json:"sender_node_id"`
+	Timestamp    int64  `json:"timestamp"`
+	Nonce        string `json:"nonce"`        // hex
+	PayloadHash  string `json:"payload_hash"` // hex РЎС‚СЂРёР±РѕРі-256
+	Signature    []byte `json:"signature"`    // Р“РћРЎРў Р  34.10-2012
+}
+
+// EnvelopeDigest вЂ” РґРµС‚РµСЂРјРёРЅРёСЂРѕРІР°РЅРЅС‹Р№ digest РґР»СЏ РїРѕРґРїРёСЃРё РєРѕРЅРІРµСЂС‚Р°.
+// Р¤РѕСЂРјР°С‚: РЎС‚СЂРёР±РѕРі-256("senderID:timestamp:nonceHex:payloadHashHex").
+func EnvelopeDigest(
+	g *crypto.GOSTProvider,
+	senderID string,
+	timestamp int64,
+	nonceHex, payloadHashHex string,
+) []byte {
+	payload := fmt.Sprintf("%s:%d:%s:%s", senderID, timestamp, nonceHex, payloadHashHex)
+	return g.Streebog256([]byte(payload))
+}
+
+// BuildEnvelope СЃРѕР±РёСЂР°РµС‚ Рё РїРѕРґРїРёСЃС‹РІР°РµС‚ РєРѕРЅРІРµСЂС‚ РѕС‚ РёРјРµРЅРё СѓР·Р»Р°.
+// Payload РЅРµ СЃРѕС…СЂР°РЅСЏРµС‚СЃСЏ РІ РєРѕРЅРІРµСЂС‚Рµ вЂ” С‚РѕР»СЊРєРѕ РµРіРѕ С…СЌС€.
+func BuildEnvelope(
+	g *crypto.GOSTProvider,
+	senderID string,
+	timestamp int64,
+	senderPriv *gost3410.PrivateKey,
+	payload []byte,
+) (*ZeroTrustEnvelope, error) {
+	if senderID == "" {
+		return nil, ErrEnvelopeEmptySender
+	}
+	if g == nil {
+		return nil, errors.New("security: nil crypto provider")
+	}
+	if senderPriv == nil {
+		return nil, errors.New("security: nil sender private key")
+	}
+
+	nonceBytes, err := crypto.RandomBytes(NonceSize)
+	if err != nil {
+		return nil, fmt.Errorf("security: generate nonce: %w", err)
+	}
+
+	env := &ZeroTrustEnvelope{
+		SenderNodeID: senderID,
+		Timestamp:    timestamp,
+		Nonce:        hex.EncodeToString(nonceBytes),
+		PayloadHash:  hex.EncodeToString(g.Streebog256(payload)),
+	}
+
+	digest := EnvelopeDigest(g, env.SenderNodeID, env.Timestamp, env.Nonce, env.PayloadHash)
+	sig, err := g.SignGOST3410(senderPriv, digest)
+	if err != nil {
+		return nil, fmt.Errorf("security: sign envelope: %w", err)
+	}
+	env.Signature = sig
+	return env, nil
+}
+
+// Validate вЂ” СЃС‚СЂСѓРєС‚СѓСЂРЅР°СЏ РїСЂРѕРІРµСЂРєР° РєРѕРЅРІРµСЂС‚Р° (Р±РµР· РєСЂРёРїС‚РѕРіСЂР°С„РёРё).
+// РџСЂРѕРІРµСЂСЏРµС‚, С‡С‚Рѕ РІСЃРµ РїРѕР»СЏ Р·Р°РїРѕР»РЅРµРЅС‹ Рё РёРјРµСЋС‚ РєРѕСЂСЂРµРєС‚РЅСѓСЋ РґР»РёРЅСѓ.
+func (e *ZeroTrustEnvelope) Validate() error {
+	if e == nil {
+		return ErrEnvelopeNil
+	}
+	if e.SenderNodeID == "" {
+		return ErrEnvelopeEmptySender
+	}
+	nonceBytes, err := hex.DecodeString(e.Nonce)
+	if err != nil || len(nonceBytes) != NonceSize {
+		return ErrEnvelopeBadNonce
+	}
+	hashBytes, err := hex.DecodeString(e.PayloadHash)
+	if err != nil || len(hashBytes) != PayloadHashSize {
+		return ErrEnvelopeBadPayloadHash
+	}
+	if len(e.Signature) != EnvelopeSignatureSize {
+		return ErrEnvelopeBadSignature
+	}
+	return nil
+}
+
+
+// ============================================
+// FILE: gateway.go
+// ============================================
+package security
+
+import (
+	"crypto/subtle"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/bi-zone/ruwireguard-go/crypto/gost/gost3410"
+
+	"nis-core/internal/crypto"
+)
+
+const (
+	// DefaultWindowSec вЂ” РјР°РєСЃРёРјР°Р»СЊРЅРѕРµ РѕС‚РєР»РѕРЅРµРЅРёРµ timestamp РѕС‚ С‚РµРєСѓС‰РµРіРѕ
+	// РІСЂРµРјРµРЅРё. Р—Р°С‰РёС‚Р° РѕС‚ replay + СЃРёРЅС…СЂРѕРЅРёР·Р°С†РёРѕРЅРЅРѕРіРѕ РґСЂРµР№С„Р°.
+	DefaultWindowSec = 15
+
+	// defaultNonceTTL вЂ” РІСЂРµРјСЏ Р¶РёР·РЅРё Р·Р°РїРёСЃРё РІ nonce-РєСЌС€Рµ.
+	// Р”РѕР»Р¶РЅРѕ Р±С‹С‚СЊ в‰Ґ 2Г—РѕРєРЅР°, С‡С‚РѕР±С‹ РїРѕРІС‚РѕСЂ РіР°СЂР°РЅС‚РёСЂРѕРІР°РЅРЅРѕ Р»РѕРІРёР»СЃСЏ.
+	defaultNonceTTL = 2 * DefaultWindowSec
+
+	// nonceCacheSoftLimit вЂ” РїСЂРё РїСЂРµРІС‹С€РµРЅРёРё РІРєР»СЋС‡Р°РµС‚СЃСЏ Р»РµРЅРёРІР°СЏ СЌРІРёРєС†РёСЏ.
+	nonceCacheSoftLimit = 128
+)
+
+// РћС€РёР±РєРё РїСЂРѕРІРµСЂРєРё Zero Trust РєРѕРЅРІРµСЂС‚Р°.
+var (
+	ErrUnknownNode  = errors.New("security: unknown node")
+	ErrReplayWindow = errors.New("security: timestamp outside allowed window")
+	ErrPayloadHash  = errors.New("security: payload hash mismatch")
+	ErrSignature    = errors.New("security: signature verification failed")
+	ErrReplayNonce  = errors.New("security: nonce already used (replay)")
+)
+
+// ZeroTrustGateway вЂ” РІР°Р»РёРґР°С‚РѕСЂ РєРѕРЅРІРµСЂС‚РѕРІ. РҐСЂР°РЅРёС‚ РґРѕРІРµСЂРµРЅРЅС‹Рµ СѓР·Р»С‹
+// Рё nonce-РєСЌС€. РџРѕС‚РѕРєРѕР±РµР·РѕРїР°СЃРµРЅ.
+type ZeroTrustGateway struct {
+	crypto *crypto.GOSTProvider
+
+	mu          sync.Mutex
+	trustedKeys map[string]*gost3410.PublicKey
+	nonceCache  map[string]int64 // nonce hex в†’ expiry unix
+
+	windowSec int64
+	nonceTTL  int64
+	now       func() int64
+}
+
+// NewZeroTrustGateway СЃРѕР·РґР°С‘С‚ С€Р»СЋР· СЃ РїР°СЂР°РјРµС‚СЂР°РјРё РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ.
+func NewZeroTrustGateway(g *crypto.GOSTProvider) *ZeroTrustGateway {
+	return &ZeroTrustGateway{
+		crypto:      g,
+		trustedKeys: make(map[string]*gost3410.PublicKey),
+		nonceCache:  make(map[string]int64),
+		windowSec:   DefaultWindowSec,
+		nonceTTL:    defaultNonceTTL,
+		now:         func() int64 { return time.Now().Unix() },
+	}
+}
+
+// RegisterTrustedNode СЂРµРіРёСЃС‚СЂРёСЂСѓРµС‚ РїСѓР±Р»РёС‡РЅС‹Р№ РєР»СЋС‡ РґРѕРІРµСЂРµРЅРЅРѕРіРѕ СѓР·Р»Р°.
+func (gt *ZeroTrustGateway) RegisterTrustedNode(nodeID string, pub *gost3410.PublicKey) {
+	if nodeID == "" || pub == nil {
+		return
+	}
+	gt.mu.Lock()
+	defer gt.mu.Unlock()
+	gt.trustedKeys[nodeID] = pub
+}
+
+// UnregisterTrustedNode СѓРґР°Р»СЏРµС‚ СѓР·РµР» РёР· РґРѕРІРµСЂРµРЅРЅС‹С….
+func (gt *ZeroTrustGateway) UnregisterTrustedNode(nodeID string) {
+	gt.mu.Lock()
+	defer gt.mu.Unlock()
+	delete(gt.trustedKeys, nodeID)
+}
+
+// SetClock Р·Р°РјРµРЅСЏРµС‚ РёСЃС‚РѕС‡РЅРёРє РІСЂРµРјРµРЅРё. РўРѕР»СЊРєРѕ РґР»СЏ С‚РµСЃС‚РѕРІ.
+func (gt *ZeroTrustGateway) SetClock(fn func() int64) {
+	if fn == nil {
+		return
+	}
+	gt.mu.Lock()
+	defer gt.mu.Unlock()
+	gt.now = fn
+}
+
+// AuthorizeRequest РІС‹РїРѕР»РЅСЏРµС‚ РїРѕР»РЅС‹Р№ С†РёРєР» РїСЂРѕРІРµСЂРєРё РєРѕРЅРІРµСЂС‚Р°:
+//
+//  1. РЎС‚СЂСѓРєС‚СѓСЂРЅР°СЏ РІР°Р»РёРґР°С†РёСЏ РєРѕРЅРІРµСЂС‚Р°.
+//  2. РЈР·РµР»-РѕС‚РїСЂР°РІРёС‚РµР»СЊ РёР·РІРµСЃС‚РµРЅ?
+//  3. Timestamp РІ РґРѕРїСѓСЃС‚РёРјРѕРј РѕРєРЅРµ?
+//  4. Payload СЃРѕРѕС‚РІРµС‚СЃС‚РІСѓРµС‚ Р·Р°СЏРІР»РµРЅРЅРѕРјСѓ С…СЌС€Сѓ?
+//  5. РџРѕРґРїРёСЃСЊ Р“РћРЎРў Р  34.10-2012 РІР°Р»РёРґРЅР°?
+//  6. Nonce РЅРµ РёСЃРїРѕР»СЊР·РѕРІР°РЅ СЂР°РЅРµРµ?
+//
+// РўРѕР»СЊРєРѕ РїРѕСЃР»Рµ СѓСЃРїРµС€РЅРѕР№ РїСЂРѕРІРµСЂРєРё РїРѕРґРїРёСЃРё nonce С„РёРєСЃРёСЂСѓРµС‚СЃСЏ РІ РєСЌС€Рµ.
+// Р­С‚Рѕ Р·Р°С‰РёС‰Р°РµС‚ РѕС‚ DoS С‡РµСЂРµР· Р·Р°Р±РёРІР°РЅРёРµ РєСЌС€Р° РјСѓСЃРѕСЂРЅС‹РјРё nonce.
+func (gt *ZeroTrustGateway) AuthorizeRequest(env *ZeroTrustEnvelope, rawPayload []byte) error {
+	if gt == nil {
+		return errors.New("security: nil gateway")
+	}
+	if err := env.Validate(); err != nil {
+		return err
+	}
+
+	gt.mu.Lock()
+	pub, ok := gt.trustedKeys[env.SenderNodeID]
+	now := gt.now()
+	window := gt.windowSec
+	nonceTTL := gt.nonceTTL
+	gt.mu.Unlock()
+
+	// 2. РЈР·РµР» РёР·РІРµСЃС‚РµРЅ?
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrUnknownNode, env.SenderNodeID)
+	}
+
+	// 3. Р’СЂРµРјРµРЅРЅРѕРµ РѕРєРЅРѕ.
+	delta := now - env.Timestamp
+	if delta < 0 {
+		delta = -delta
+	}
+	if delta > window {
+		return fmt.Errorf("%w: delta=%ds, window=%ds",
+			ErrReplayWindow, delta, window)
+	}
+
+	// 4. РҐСЌС€ payload (constant-time РЅР° РІСЃСЏРєРёР№ СЃР»СѓС‡Р°Р№).
+	expectedHash := hex.EncodeToString(gt.crypto.Streebog256(rawPayload))
+	if subtle.ConstantTimeCompare([]byte(expectedHash), []byte(env.PayloadHash)) != 1 {
+		return ErrPayloadHash
+	}
+
+	// 5. РџРѕРґРїРёСЃСЊ.
+	digest := EnvelopeDigest(gt.crypto, env.SenderNodeID, env.Timestamp, env.Nonce, env.PayloadHash)
+	ok, err := gt.crypto.VerifyGOST3410(pub, digest, env.Signature)
+	if err != nil {
+		return fmt.Errorf("security: verify signature: %w", err)
+	}
+	if !ok {
+		return ErrSignature
+	}
+
+	// 6. Nonce вЂ” РїРѕРґ РјСЊСЋС‚РµРєСЃРѕРј, Р°С‚РѕРјР°СЂРЅРѕ check-and-set.
+	gt.mu.Lock()
+	defer gt.mu.Unlock()
+
+	gt.evictExpiredLocked(now)
+
+	if _, seen := gt.nonceCache[env.Nonce]; seen {
+		return fmt.Errorf("%w: %s", ErrReplayNonce, env.Nonce)
+	}
+	gt.nonceCache[env.Nonce] = now + nonceTTL
+	return nil
+}
+
+// evictExpiredLocked С‡РёСЃС‚РёС‚ РїСЂРѕС‚СѓС…С€РёРµ Р·Р°РїРёСЃРё nonce-РєСЌС€Р°.
+// Р’С‹Р·С‹РІР°РµС‚СЃСЏ С‚РѕР»СЊРєРѕ РїРѕРґ gt.mu.
+func (gt *ZeroTrustGateway) evictExpiredLocked(now int64) {
+	if len(gt.nonceCache) < nonceCacheSoftLimit {
+		return
+	}
+	for k, exp := range gt.nonceCache {
+		if exp <= now {
+			delete(gt.nonceCache, k)
+		}
+	}
+}
+
+// NonceCacheSize РІРѕР·РІСЂР°С‰Р°РµС‚ С‚РµРєСѓС‰РёР№ СЂР°Р·РјРµСЂ nonce-РєСЌС€Р°.
+// Р”Р»СЏ РјРѕРЅРёС‚РѕСЂРёРЅРіР° Рё С‚РµСЃС‚РѕРІ.
+func (gt *ZeroTrustGateway) NonceCacheSize() int {
+	gt.mu.Lock()
+	defer gt.mu.Unlock()
+	return len(gt.nonceCache)
+}
+
+
+// ============================================
+// FILE: gateway_test.go
+// ============================================
+package security
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/bi-zone/ruwireguard-go/crypto/gost/gost3410"
+
+	"nis-core/internal/crypto"
+)
+
+type testClock struct {
+	mu  sync.Mutex
+	now int64
+}
+
+func (c *testClock) Now() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *testClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now += int64(d.Seconds())
+}
+
+type testEnv struct {
+	g     *crypto.GOSTProvider
+	priv  *gost3410.PrivateKey
+	pub   *gost3410.PublicKey
+	gw    *ZeroTrustGateway
+	clock *testClock
+}
+
+func newTestEnv(t *testing.T) *testEnv {
+	t.Helper()
+	g := crypto.NewGOSTProvider()
+	priv, pub, err := g.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("keypair: %v", err)
+	}
+	clock := &testClock{now: 1_700_000_000}
+	gw := NewZeroTrustGateway(g)
+	gw.SetClock(clock.Now)
+	gw.RegisterTrustedNode("node-A", pub)
+	return &testEnv{g: g, priv: priv, pub: pub, gw: gw, clock: clock}
+}
+
+// ---------- Happy path ----------
+
+func TestZeroTrustGateway_HappyPath(t *testing.T) {
+	env := newTestEnv(t)
+	payload := []byte(`{"action":"lock","deal_id":"D-001"}`)
+
+	envelope, err := BuildEnvelope(env.g, "node-A", env.clock.Now(), env.priv, payload)
+	if err != nil {
+		t.Fatalf("BuildEnvelope: %v", err)
+	}
+
+	if err := env.gw.AuthorizeRequest(envelope, payload); err != nil {
+		t.Fatalf("AuthorizeRequest: %v", err)
+	}
+	if env.gw.NonceCacheSize() != 1 {
+		t.Fatalf("nonce cache size = %d, want 1", env.gw.NonceCacheSize())
+	}
+}
+
+func TestZeroTrustGateway_TwoEnvelopesSameTime(t *testing.T) {
+	env := newTestEnv(t)
+	p1 := []byte("first")
+	p2 := []byte("second")
+
+	e1, _ := BuildEnvelope(env.g, "node-A", env.clock.Now(), env.priv, p1)
+	e2, _ := BuildEnvelope(env.g, "node-A", env.clock.Now(), env.priv, p2)
+
+	if err := env.gw.AuthorizeRequest(e1, p1); err != nil {
+		t.Fatalf("e1: %v", err)
+	}
+	if err := env.gw.AuthorizeRequest(e2, p2); err != nil {
+		t.Fatalf("e2: %v", err)
+	}
+	if env.gw.NonceCacheSize() != 2 {
+		t.Fatalf("nonce cache size = %d, want 2", env.gw.NonceCacheSize())
+	}
+}
+
+// ---------- РћС‚РєР»РѕРЅРµРЅРёСЏ ----------
+
+func TestZeroTrustGateway_UnknownNode(t *testing.T) {
+	env := newTestEnv(t)
+	payload := []byte("x")
+	envelope, _ := BuildEnvelope(env.g, "node-B", env.clock.Now(), env.priv, payload)
+
+	err := env.gw.AuthorizeRequest(envelope, payload)
+	if !errors.Is(err, ErrUnknownNode) {
+		t.Fatalf("err = %v, want ErrUnknownNode", err)
+	}
+}
+
+func TestZeroTrustGateway_TimestampTooOld(t *testing.T) {
+	env := newTestEnv(t)
+	payload := []byte("x")
+	envelope, _ := BuildEnvelope(env.g, "node-A", env.clock.Now()-60, env.priv, payload)
+
+	err := env.gw.AuthorizeRequest(envelope, payload)
+	if !errors.Is(err, ErrReplayWindow) {
+		t.Fatalf("err = %v, want ErrReplayWindow", err)
+	}
+}
+
+func TestZeroTrustGateway_TimestampTooFuture(t *testing.T) {
+	env := newTestEnv(t)
+	payload := []byte("x")
+	envelope, _ := BuildEnvelope(env.g, "node-A", env.clock.Now()+60, env.priv, payload)
+
+	err := env.gw.AuthorizeRequest(envelope, payload)
+	if !errors.Is(err, ErrReplayWindow) {
+		t.Fatalf("err = %v, want ErrReplayWindow", err)
+	}
+}
+
+func TestZeroTrustGateway_PayloadMismatch(t *testing.T) {
+	env := newTestEnv(t)
+	payload := []byte("original")
+	envelope, _ := BuildEnvelope(env.g, "node-A", env.clock.Now(), env.priv, payload)
+
+	err := env.gw.AuthorizeRequest(envelope, []byte("tampered"))
+	if !errors.Is(err, ErrPayloadHash) {
+		t.Fatalf("err = %v, want ErrPayloadHash", err)
+	}
+}
+
+func TestZeroTrustGateway_TamperedSignature(t *testing.T) {
+	env := newTestEnv(t)
+	payload := []byte("x")
+	envelope, _ := BuildEnvelope(env.g, "node-A", env.clock.Now(), env.priv, payload)
+	envelope.Signature[0] ^= 0x01
+
+	err := env.gw.AuthorizeRequest(envelope, payload)
+	if !errors.Is(err, ErrSignature) {
+		t.Fatalf("err = %v, want ErrSignature", err)
+	}
+}
+
+func TestZeroTrustGateway_ReplaySameNonce(t *testing.T) {
+	env := newTestEnv(t)
+	payload := []byte("x")
+	envelope, _ := BuildEnvelope(env.g, "node-A", env.clock.Now(), env.priv, payload)
+
+	if err := env.gw.AuthorizeRequest(envelope, payload); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+
+	err := env.gw.AuthorizeRequest(envelope, payload)
+	if !errors.Is(err, ErrReplayNonce) {
+		t.Fatalf("err = %v, want ErrReplayNonce", err)
+	}
+}
+
+// ---------- Nonce cache ----------
+
+func TestZeroTrustGateway_NonceEviction(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Р—Р°Р±РёРІР°РµРј РєСЌС€ РїСЂРѕС‚СѓС…С€РёРјРё Р·Р°РїРёСЃСЏРјРё.
+	env.gw.mu.Lock()
+	for i := 0; i < 200; i++ {
+		env.gw.nonceCache[fmt.Sprintf("stale-%d", i)] = env.clock.Now() - 1
+	}
+	env.gw.mu.Unlock()
+
+	payload := []byte("x")
+	envelope, _ := BuildEnvelope(env.g, "node-A", env.clock.Now(), env.priv, payload)
+	if err := env.gw.AuthorizeRequest(envelope, payload); err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+
+	// РџРѕСЃР»Рµ СЌРІРёРєС†РёРё РІ РєСЌС€Рµ РґРѕР»Р¶РµРЅ РѕСЃС‚Р°С‚СЊСЃСЏ С‚РѕР»СЊРєРѕ РЅР°С€ СЃРІРµР¶РёР№ nonce.
+	if size := env.gw.NonceCacheSize(); size != 1 {
+		t.Fatalf("cache size = %d, want 1 after eviction", size)
+	}
+}
+
+func TestZeroTrustGateway_ReplayWindowEdge(t *testing.T) {
+	env := newTestEnv(t)
+	payload := []byte("x")
+
+	// Р РѕРІРЅРѕ РЅР° РіСЂР°РЅРёС†Рµ (15 СЃРµРєСѓРЅРґ) вЂ” РїСЂРёРЅРёРјР°РµС‚СЃСЏ.
+	e1, _ := BuildEnvelope(env.g, "node-A", env.clock.Now()-15, env.priv, payload)
+	if err := env.gw.AuthorizeRequest(e1, payload); err != nil {
+		t.Fatalf("edge acceptance failed: %v", err)
+	}
+
+	// 16 СЃРµРєСѓРЅРґ вЂ” РѕС‚РєР»РѕРЅСЏРµС‚СЃСЏ.
+	e2, _ := BuildEnvelope(env.g, "node-A", env.clock.Now()-16, env.priv, payload)
+	if err := env.gw.AuthorizeRequest(e2, payload); !errors.Is(err, ErrReplayWindow) {
+		t.Fatalf("16s should be rejected, got: %v", err)
+	}
+}
+
+// ---------- Structural validation ----------
+
+func TestZeroTrustEnvelope_Validate_Structural(t *testing.T) {
+	g := crypto.NewGOSTProvider()
+	priv, _, _ := g.GenerateKeyPair()
+	valid, err := BuildEnvelope(g, "node-A", 1_700_000_000, priv, []byte("x"))
+	if err != nil {
+		t.Fatalf("BuildEnvelope: %v", err)
+	}
+
+	t.Run("nil", func(t *testing.T) {
+		var nilEnv *ZeroTrustEnvelope
+		if err := nilEnv.Validate(); err == nil {
+			t.Fatal("expected error for nil envelope")
+		}
+	})
+
+	cases := []struct {
+		name   string
+		mutate func(*ZeroTrustEnvelope)
+	}{
+		{"empty sender", func(e *ZeroTrustEnvelope) { e.SenderNodeID = "" }},
+		{"bad nonce hex", func(e *ZeroTrustEnvelope) { e.Nonce = "zz" }},
+		{"short nonce", func(e *ZeroTrustEnvelope) { e.Nonce = "0011" }},
+		{"bad payload hash", func(e *ZeroTrustEnvelope) { e.PayloadHash = "not-hex" }},
+		{"short payload hash", func(e *ZeroTrustEnvelope) { e.PayloadHash = "0011" }},
+		{"short signature", func(e *ZeroTrustEnvelope) { e.Signature = []byte{1, 2, 3} }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cp := *valid
+			cp.Signature = append([]byte(nil), valid.Signature...)
+			c.mutate(&cp)
+			if err := cp.Validate(); err == nil {
+				t.Fatal("expected structural error")
+			}
+		})
+	}
+}
+
+
